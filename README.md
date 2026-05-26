@@ -4,6 +4,8 @@ MAGMA 是面向 OpenClaw 多 Agent 系统的跨会话、跨 Agent 记忆架构�
 
 它负责把对话事件、实体、关系、向量、召回记录和反馈写入本地 SQLite + FAISS 记忆层，并通过 `magma-recall` OpenClaw 插件，在 Agent 构建提示词前自动注入相关记忆。
 
+![MAGMA 架构全景](docs/assets/magma-architecture-overview.png)
+
 ## 当前运行态
 
 - Embedding 模型：本地 `BAAI/bge-small-zh-v1.5`
