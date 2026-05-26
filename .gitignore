@@ -1,4 +1,4 @@
-# Data files (contains memory content, must not be committed)
+# Data files (contains memory data, must not be uploaded)
 data/
 *.db
 *.db-shm
