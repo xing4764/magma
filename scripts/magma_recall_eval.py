@@ -6,12 +6,13 @@ the top retrieved memories from the live MAGMA API.
 
 import argparse
 import json
+import os
 import sys
 import urllib.error
 import urllib.request
 
 
-API_BASE = "http://127.0.0.1:8902"
+API_BASE = os.environ.get("MAGMA_API_BASE", "http://127.0.0.1:8902").rstrip("/")
 
 
 CASES = [

@@ -30,6 +30,24 @@ MAGMA 是面向 OpenClaw 多 Agent 系统的跨会话、跨 Agent 记忆架构�
 
 LLM 后端和 embedding 模型是两套东西，不能混用。DeepSeek V3 用于慢路径关系抽取、因果推断和记忆巩固；`bge-small-zh-v1.5` 用于本地语义向量召回。历史上的 MiniLM-L6-v2 / 384 维向量不是当前运行态。
 
+## 可用性边界
+
+这个仓库包含 MAGMA 的代码、OpenClaw 插件和运维脚本，但不包含任何本地运行数据。首次启动会创建一个空数据库；要看到真实召回效果，需要通过 API、MCP 或 OpenClaw 插件持续写入记忆。
+
+开箱即用：
+
+- FastAPI API 服务
+- SQLite 表结构自动初始化
+- 本地 embedding 编码
+- 手动写入、查询、MCP 代理
+- doctor / ops / governance 运维脚本
+
+需要外部系统：
+
+- OpenClaw 自动召回和自动抓取需要安装 `openclaw-plugin-magma-recall`
+- 慢路径 LLM 巩固需要你自己配置可用的 LLM 后端
+- 生产数据、FAISS 索引和备份不会随仓库发布
+
 ## 核心能力
 
 - 对话前自动召回记忆
@@ -80,10 +98,14 @@ HANDOFF_OPENCLAW.md
 
 ```powershell
 cd C:\openclaw-magma
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 ```
 
 如果 Hugging Face 访问慢或不可用，可以在首次加载模型前设置 `HF_ENDPOINT`。
+
+可以参考 `.env.example` 配置端口、数据库路径、embedding 模型和后台任务间隔。
 
 ## 启动 API
 
@@ -92,7 +114,34 @@ cd C:\openclaw-magma
 python -m magma.api.server
 ```
 
-生产环境的 OpenClaw 集成默认使用 `8902` 端口。
+默认监听 `127.0.0.1:8902`。首次启动会自动创建 `data/magma.db`，不需要手动初始化数据库。
+
+启动后验证：
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:8902/api/v1/health
+python scripts\magma_doctor.py --quick
+```
+
+写入一条测试记忆：
+
+```powershell
+Invoke-RestMethod `
+  -Method Post `
+  -Uri http://127.0.0.1:8902/api/v1/nodes `
+  -ContentType "application/json" `
+  -Body '{"id":"demo:hello","label":"event","properties":{"content":"MAGMA demo memory","source":"demo","importance":0.5}}'
+```
+
+查询测试记忆：
+
+```powershell
+Invoke-RestMethod `
+  -Method Post `
+  -Uri http://127.0.0.1:8902/api/v1/query `
+  -ContentType "application/json" `
+  -Body '{"query":"demo memory","top_k":3}'
+```
 
 ## OpenClaw 集成
 
@@ -100,6 +149,36 @@ OpenClaw 插件位于：
 
 ```text
 openclaw-plugin-magma-recall/
+```
+
+示例配置：
+
+```json
+{
+  "plugins": {
+    "entries": {
+      "magma-recall": {
+        "path": "C:\\openclaw-magma\\openclaw-plugin-magma-recall",
+        "config": {
+          "enabled": true,
+          "apiBaseUrl": "http://127.0.0.1:8902",
+          "topK": 6,
+          "timeoutMs": 12000,
+          "scoreThreshold": 0.35,
+          "magmaCwd": "C:\\openclaw-magma",
+          "capture": {
+            "enabled": true,
+            "ttlDays": 180,
+            "maxChars": 4000
+          }
+        },
+        "hooks": {
+          "allowConversationAccess": true
+        }
+      }
+    }
+  }
+}
 ```
 
 插件注册三个 hook：

@@ -5,11 +5,12 @@ conversation query is broad and semantic neighbors are noisy.
 """
 
 import json
+import os
 import sys
 import urllib.request
 
 
-API_BASE = "http://127.0.0.1:8902"
+API_BASE = os.environ.get("MAGMA_API_BASE", "http://127.0.0.1:8902").rstrip("/")
 
 
 ANCHORS = [

@@ -20,10 +20,10 @@ if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-API_BASE = "http://127.0.0.1:8902"
+API_BASE = os.environ.get("MAGMA_API_BASE", "http://127.0.0.1:8902").rstrip("/")
 PROJECT_ROOT = Path(__file__).parent.parent
-DB_PATH = PROJECT_ROOT / "data" / "magma.db"
-RECALL_LOG = Path.home() / ".openclaw" / "logs" / "magma-recall.jsonl"
+DB_PATH = Path(os.environ.get("MAGMA_DB_PATH", str(PROJECT_ROOT / "data" / "magma.db")))
+RECALL_LOG = Path(os.environ.get("MAGMA_RECALL_LOG", str(Path.home() / ".openclaw" / "logs" / "magma-recall.jsonl")))
 TIMEOUT_S = 10
 CST = timezone(timedelta(hours=8))
 

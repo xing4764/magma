@@ -396,6 +396,6 @@ if __name__ == "__main__":
     import uvicorn
 
     app = create_app()
-    host = os.environ.get("MAGMA_API_HOST", "0.0.0.0")
-    port = int(os.environ.get("MAGMA_API_PORT", "8901"))
+    host = os.environ.get("MAGMA_API_HOST", "127.0.0.1")
+    port = int(os.environ.get("MAGMA_API_PORT", "8902"))
     uvicorn.run(app, host=host, port=port)

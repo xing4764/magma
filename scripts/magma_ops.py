@@ -21,9 +21,9 @@ if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-API_BASE = "http://127.0.0.1:8902"
+API_BASE = os.environ.get("MAGMA_API_BASE", "http://127.0.0.1:8902").rstrip("/")
 PROJECT_ROOT = Path(__file__).parent.parent
-DB_PATH = PROJECT_ROOT / "data" / "magma.db"
+DB_PATH = Path(os.environ.get("MAGMA_DB_PATH", str(PROJECT_ROOT / "data" / "magma.db")))
 MCP_SERVER = PROJECT_ROOT / "magma" / "api" / "mcp_server.py"
 OPENCLAW_CONFIG = Path.home() / ".openclaw" / "openclaw.json"
 OPENCLAW_NPM_PACKAGE = Path.home() / ".openclaw" / "npm" / "package.json"

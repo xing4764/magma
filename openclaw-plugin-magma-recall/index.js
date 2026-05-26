@@ -1,11 +1,14 @@
 import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 const TAG = "[magma-recall]";
 const STRIP_RE = /<magma-memories>[\s\S]*?<\/magma-memories>\s*/g;
 const PROMPT_CACHE_TTL_MS = 10 * 60 * 1000;
 const PROMPT_CACHE_MAX_SIZE = 1000;
+const PLUGIN_DIR = path.dirname(fileURLToPath(import.meta.url));
+const DEFAULT_MAGMA_CWD = path.resolve(PLUGIN_DIR, "..");
 const OPS_ANCHOR_RULES = [
   { id: "ops:magma:model-runtime-2026-05-26", terms: ["MiniLM", "384", "bge-small", "bge-small-zh", "embedding", "DeepSeek", "OpenRouter", "LLM"] },
   { id: "ops:magma:health-signals", terms: ["recent_capture", "doctor", "yellow", "红黄绿"] },
@@ -22,7 +25,7 @@ const pendingRecalls = new Map();
 function resolveConfig(raw = {}) {
   return {
     enabled: raw.enabled !== false,
-    apiBaseUrl: String(raw.apiBaseUrl || "http://127.0.0.1:8901").replace(/\/+$/, ""),
+    apiBaseUrl: String(raw.apiBaseUrl || "http://127.0.0.1:8902").replace(/\/+$/, ""),
     topK: Number.isFinite(raw.topK) ? Math.max(1, Math.min(10, Math.floor(raw.topK))) : 6,
     timeoutMs: Number.isFinite(raw.timeoutMs) ? Math.max(200, Math.floor(raw.timeoutMs)) : 12000,
     scoreThreshold: Number.isFinite(raw.scoreThreshold) ? raw.scoreThreshold : 0.35,
@@ -31,7 +34,7 @@ function resolveConfig(raw = {}) {
     captureMaxChars: Number.isFinite(raw.capture?.maxChars) ? Math.max(200, Math.floor(raw.capture.maxChars)) : 4000,
     autoStartApi: raw.autoStartApi !== false,
     python: String(raw.python || "python"),
-    magmaCwd: String(raw.magmaCwd || "C:\\openclaw-magma"),
+    magmaCwd: String(raw.magmaCwd || DEFAULT_MAGMA_CWD),
     excludeAgents: Array.isArray(raw.excludeAgents) ? raw.excludeAgents.map(String) : [],
   };
 }
@@ -55,7 +58,7 @@ function parseApiPort(apiBaseUrl) {
     const url = new URL(apiBaseUrl);
     return url.port || (url.protocol === "https:" ? "443" : "80");
   } catch {
-    return "8901";
+    return "8902";
   }
 }
 

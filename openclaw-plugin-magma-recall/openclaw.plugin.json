@@ -57,7 +57,7 @@
       },
       "magmaCwd": {
         "type": "string",
-        "default": "C:\\openclaw-magma"
+        "default": ""
       },
       "excludeAgents": {
         "type": "array",
