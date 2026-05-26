@@ -1,0 +1,16 @@
+{
+  "name": "@local/magma-recall",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "./index.js",
+  "description": "MAGMA automatic recall injection plugin for OpenClaw",
+  "openclaw": {
+    "extensions": [
+      "./index.js"
+    ],
+    "compat": {
+      "pluginApi": ">=2026.3.13",
+      "minGatewayVersion": ">=2026.3.13"
+    }
+  }
+}

@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+httpx
+sentence-transformers
+faiss-cpu
+pydantic
+jieba

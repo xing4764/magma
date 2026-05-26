@@ -1,0 +1,31 @@
+# Data files (contains memory content, must not be committed)
+data/
+*.db
+*.db-shm
+*.db-wal
+*.index
+
+# Backups
+backups/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.eggs/
+*.egg-info/
+dist/
+build/
+
+# Environment
+.env
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+.DS_Store

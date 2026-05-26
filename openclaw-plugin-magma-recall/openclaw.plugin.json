@@ -1,0 +1,71 @@
+{
+  "id": "magma-recall",
+  "name": "MAGMA Recall",
+  "description": "Automatically recalls MAGMA memories before prompt build and injects compact context.",
+  "activation": {
+    "onStartup": true
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "enabled": {
+        "type": "boolean",
+        "default": true
+      },
+      "apiBaseUrl": {
+        "type": "string",
+        "default": "http://127.0.0.1:8902"
+      },
+      "topK": {
+        "type": "number",
+        "default": 6
+      },
+      "timeoutMs": {
+        "type": "number",
+        "default": 12000
+      },
+      "scoreThreshold": {
+        "type": "number",
+        "default": 0.35
+      },
+      "capture": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "default": true
+          },
+          "ttlDays": {
+            "type": "number",
+            "default": 180
+          },
+          "maxChars": {
+            "type": "number",
+            "default": 4000
+          }
+        }
+      },
+      "autoStartApi": {
+        "type": "boolean",
+        "default": true
+      },
+      "python": {
+        "type": "string",
+        "default": "python"
+      },
+      "magmaCwd": {
+        "type": "string",
+        "default": "C:\\openclaw-magma"
+      },
+      "excludeAgents": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "default": []
+      }
+    }
+  }
+}
