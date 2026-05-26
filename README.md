@@ -1,91 +1,139 @@
-# MAGMA - Multi-Graph Adaptive Memory Architecture
+# MAGMA
 
-为 AI Agent 提供跨会话、跨 Agent 的知识图谱记忆系统。
+Multi-Graph Adaptive Memory Architecture for OpenClaw agents.
 
-## 核心能力
+MAGMA provides cross-session and cross-agent memory for an OpenClaw agent system. It stores conversation events, entities, relations, embeddings, recall events, and feedback in a local SQLite + FAISS based memory layer, then injects relevant memories into agents through the `magma-recall` OpenClaw plugin.
 
-- **自动召回**：Agent 对话时自动注入相关记忆上下文
-- **自动抓取**：对话内容自动写入知识图谱
-- **跨 Agent 共享**：多个 Agent 之间的记忆互通
-- **反馈闭环**：召回质量自动评估和优化
-- **意图路由**：根据查询意图选择最优召回策略
-- **轻量治理**：自动识别重复、过期、低质量记忆
-- **健康监控**：红黄绿诊断 + 自助排障脚本
+## Current Runtime
 
-## 架构
+- Embedding model: local `BAAI/bge-small-zh-v1.5`
+- Embedding dimension: 512
+- Slow-path LLM backend: DeepSeek V3 via OpenRouter
+- Main API: `http://127.0.0.1:8902`
+- MCP server: thin HTTP proxy to the 8902 API
 
-四正交图架构（Event / Entity / Relation / Concept）：
-- **Event**：对话事件、操作记录
-- **Entity**：人物、项目、商品、概念
-- **Relation**：实体之间的关系（depends_on、created_by 等）
-- **Concept**：主题、领域、技能
+The LLM backend and embedding model are separate. DeepSeek V3 is used for slow-path reasoning/extraction. `bge-small-zh-v1.5` is used for local semantic retrieval. Historical MiniLM-L6-v2 / 384-dimensional vectors are not the current runtime state.
 
-## 技术栈
+## Core Capabilities
 
-- Python 3.13+
-- SQLite + FAISS（向量检索）
-- FastAPI（API 服务）
-- sentence-transformers（embedding）
-- OpenClaw Plugin SDK
+- Automatic recall before prompt build
+- Automatic L0 capture after agent responses
+- Cross-agent memory with `source_agent_id` and `department`
+- Semantic + keyword + lifecycle-aware retrieval
+- Recall feedback and importance updates
+- Operational anchors for high-value system facts
+- Red/yellow/green diagnostics
+- Conservative memory governance with dry-run and soft apply
+- OpenClaw MCP compatibility through the 8902 main chain
 
-## 目录结构
+## Repository Layout
 
+```text
+magma/
+  api/
+    server.py              # FastAPI service
+    mcp_server.py          # MCP thin proxy
+  graph/
+    sqlite_store.py        # SQLite graph/memory store
+  vector/
+    encoder.py             # sentence-transformers encoder
+  backup.py
+  entities.py
+  search.py
+
+openclaw-plugin-magma-recall/
+  index.js                 # OpenClaw hook plugin
+  openclaw.plugin.json
+  package.json
+
+scripts/
+  magma_doctor.py          # Health diagnostics
+  magma_ops.py             # Status and safe repair checks
+  magma_governance.py      # Dry-run / soft memory governance
+  magma_recall_eval.py     # Recall quality evaluation
+  migrate_source_agent.py  # Backfill source attribution
+  seed_operational_anchors.py
+  magma_cli.py
+
+RUNBOOK.md
+HANDOFF_OPENCLAW.md
+起源.md
 ```
-magma/                          # 核心 Python 包
-├── api/                        # API 服务 + MCP 服务器
-├── core/                       # 图谱核心逻辑
-├── encoder/                    # 文本编码器
-├── search/                     # 搜索引擎
-└── store/                      # 存储层
 
-scripts/                        # 运维脚本
-├── magma_doctor.py             # 健康诊断（红黄绿）
-├── magma_ops.py                # 状态检查 + 安全自修
-├── magma_governance.py         # 记忆治理（去重/降权/清理）
-├── magma_recall_eval.py        # 召回质量评估
-├── seed_operational_anchors.py # 运维锚点注入
-└── migrate_source_agent.py     # 数据库迁移
+## Install
 
-openclaw-plugin-magma-recall/   # OpenClaw 插件
-```
-
-## 部署
-
-```bash
-# 安装依赖
+```powershell
+cd C:\openclaw-magma
 pip install -r requirements.txt
+```
 
-# 初始化数据库
-python -m magma.store.init
+If Hugging Face access is slow or blocked, set `HF_ENDPOINT` before the first model load.
 
-# 启动 API 服务
+## Run API
+
+```powershell
+cd C:\openclaw-magma
 python -m magma.api.server
-
-# 配置 OpenClaw MCP（在 openclaw.json 中）
-# 参考 RUNBOOK.md
 ```
 
-## 运维
+The production OpenClaw integration expects the API on port `8902`.
 
-```bash
-# 健康检查
-python scripts/magma_doctor.py --json
+## OpenClaw Integration
 
-# 状态查看
-python scripts/magma_ops.py status
+The OpenClaw plugin is in:
 
-# 安全自修
-python scripts/magma_ops.py repair
-
-# 记忆治理（dry-run）
-python scripts/magma_governance.py --dry-run --json
-
-# 召回质量测试
-python scripts/magma_recall_eval.py
+```text
+openclaw-plugin-magma-recall/
 ```
 
-详细运维文档见 [RUNBOOK.md](RUNBOOK.md)。
+The plugin registers:
 
-## 许可证
+- `before_prompt_build` for automatic recall
+- `agent_end` for automatic capture and weak positive feedback
+- `before_message_write` for stripping injected memory from persisted history
+
+The MCP entrypoint remains compatible:
+
+```powershell
+python -m magma.api.mcp_server
+```
+
+All MCP tools proxy to `http://127.0.0.1:8902/api/v1/...` instead of loading SQLite and embeddings inside the stdio process.
+
+## Operations
+
+```powershell
+# Health check
+python scripts\magma_doctor.py --json
+
+# Short status
+python scripts\magma_ops.py status
+
+# Safe repair checks
+python scripts\magma_ops.py repair
+
+# Governance dry-run
+python scripts\magma_governance.py --dry-run --json
+
+# Soft governance apply
+python scripts\magma_governance.py --apply --json
+
+# Recall quality evaluation
+python scripts\magma_recall_eval.py
+```
+
+## Data Safety
+
+Runtime data is intentionally excluded from Git:
+
+- `data/`
+- `*.db`, `*.db-shm`, `*.db-wal`
+- `*.index`
+- `backups/`
+- `.env`
+
+Do not commit local memory databases, FAISS indexes, OpenClaw credentials, Feishu secrets, OpenRouter/OpenAI keys, or token files.
+
+## License
 
 MIT
