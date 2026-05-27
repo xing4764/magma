@@ -25,7 +25,7 @@ Common `YELLOW` examples:
 
 Common `RED` examples:
 
-- `api_8902` is down.
+- The configured MAGMA API is down.
 - MCP is not in `http_proxy` mode.
 - Embedding coverage drops below the safety threshold.
 - The database cannot be read.
@@ -40,7 +40,7 @@ python C:\openclaw-magma\scripts\magma_ops.py repair
 
 The repair command checks:
 
-- MAGMA API port `8902`
+- The configured MAGMA API port
 - MAGMA API health
 - MCP proxy mode
 - SQLite database readability and embedding coverage
@@ -74,6 +74,16 @@ MAGMA stores both direct hook execution and source attribution:
 - `department`: the human-facing department/source label.
 
 Use `source_agent_id` and `department` for cross-agent filtering, QA, and memory provenance.
+
+## Retrieval Quality
+
+The realtime recall path must stay fast because it runs before prompt build:
+
+- Keep `bge-small-zh-v1.5` as the default first-stage embedding model unless an A/B test proves a replacement is better.
+- Prefer high-density `ops_anchor`, `L1`, `decision`, `fact`, and `current_state` memories for operational questions.
+- Keep L0 raw chat memories as evidence, but do not let generic chat fragments dominate high-signal anchors.
+- Use `scripts/qwen_embedding_probe.py` and `scripts/qwen_reranker_probe.py` for offline A/B tests only.
+- Do not enable Qwen3 reranking in the realtime `before_prompt_build` path on CPU-only 12GB hosts; top20 reranking can take tens of seconds.
 
 ## Escalation Rule
 

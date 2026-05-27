@@ -7,12 +7,29 @@ the top retrieved memories from the live MAGMA API.
 import argparse
 import json
 import os
+import re
 import sys
 import urllib.error
 import urllib.request
+from pathlib import Path
 
 
-API_BASE = os.environ.get("MAGMA_API_BASE", "http://127.0.0.1:8902").rstrip("/")
+def _configured_api_base() -> str:
+    env_base = os.environ.get("MAGMA_API_BASE")
+    if env_base:
+        return env_base.rstrip("/")
+    config_path = Path.home() / ".openclaw" / "openclaw.json"
+    try:
+        text = config_path.read_text(encoding="utf-8", errors="ignore")
+        match = re.search(r'"apiBaseUrl"\s*:\s*"(http://127\.0\.0\.1:\d+)"', text)
+        if match:
+            return match.group(1).rstrip("/")
+    except OSError:
+        pass
+    return "http://127.0.0.1:8902"
+
+
+API_BASE = _configured_api_base()
 
 
 CASES = [

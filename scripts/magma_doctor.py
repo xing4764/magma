@@ -20,8 +20,25 @@ if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-API_BASE = os.environ.get("MAGMA_API_BASE", "http://127.0.0.1:8902").rstrip("/")
 PROJECT_ROOT = Path(__file__).parent.parent
+
+
+def _configured_api_base() -> str:
+    env_base = os.environ.get("MAGMA_API_BASE")
+    if env_base:
+        return env_base.rstrip("/")
+    config_path = Path.home() / ".openclaw" / "openclaw.json"
+    try:
+        text = config_path.read_text(encoding="utf-8", errors="ignore")
+        match = re.search(r'"apiBaseUrl"\s*:\s*"(http://127\.0\.0\.1:\d+)"', text)
+        if match:
+            return match.group(1).rstrip("/")
+    except OSError:
+        pass
+    return "http://127.0.0.1:8902"
+
+
+API_BASE = _configured_api_base()
 DB_PATH = Path(os.environ.get("MAGMA_DB_PATH", str(PROJECT_ROOT / "data" / "magma.db")))
 RECALL_LOG = Path(os.environ.get("MAGMA_RECALL_LOG", str(Path.home() / ".openclaw" / "logs" / "magma-recall.jsonl")))
 TIMEOUT_S = 10

@@ -215,7 +215,24 @@ python scripts\magma_governance.py --apply --json
 
 # 召回质量评测
 python scripts\magma_recall_eval.py
+
+# Qwen3 embedding 旁路评估，不修改生产数据
+python scripts\qwen_embedding_probe.py --model .\models\Qwen\Qwen3-Embedding-0___6B
+
+# Qwen3 reranker 旁路评估，不接入实时召回
+python scripts\qwen_reranker_probe.py --candidate-k 20 --top-k 6
 ```
+
+## 召回质量策略
+
+MAGMA 的实时召回链路默认保持轻量：
+
+1. `BAAI/bge-small-zh-v1.5` 负责快速向量召回。
+2. 中文关键词、生命周期、source agent、importance 和 current-state 信号做规则重排。
+3. `ops_anchor`、`L1`、`current_state` 等高密度记忆在运维和架构类问题中优先。
+4. L0 原始对话保留为证据，但不会轻易压过高密度记忆。
+
+`Qwen3-Embedding-0.6B` 和 `Qwen3-Reranker-0.6B` 目前作为旁路评估工具使用。实测 CPU 环境下 reranker 对 top20 候选精排会达到数十秒级，不适合放进 `before_prompt_build` 实时链路；它更适合离线质量审计、慢路径治理和后续 L1 提炼评估。
 
 ## 数据安全
 
@@ -225,6 +242,8 @@ python scripts\magma_recall_eval.py
 - `*.db`、`*.db-shm`、`*.db-wal`
 - `*.index`
 - `backups/`
+- `models/`
+- `logs/`
 - `.env`
 
 不要提交本地记忆数据库、FAISS 索引、OpenClaw 凭据、飞书密钥、OpenRouter/OpenAI key 或 token 文件。

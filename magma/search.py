@@ -60,7 +60,24 @@ OPERATIONAL_KEYWORDS = (
     "http_proxy",
     "runbook.md",
     "bge-small-zh-v1.5",
+    "qwen3",
+    "reranker",
 )
+
+OPERATIONAL_TRIGGER_KEYWORDS = OPERATIONAL_KEYWORDS + (
+    "magma",
+    "openclaw",
+    "embedding",
+    "\u7f51\u5173",
+    "\u8bb0\u5fc6",
+)
+
+HIGH_DENSITY_LAYERS = {"ops_anchor", "L1", "summary", "decision", "fact", "current_state"}
+
+
+def _is_operational_query(query: str) -> bool:
+    query_lower = (query or "").lower()
+    return any(keyword.lower() in query_lower for keyword in OPERATIONAL_TRIGGER_KEYWORDS)
 
 
 def _parse_time(value: Optional[str]) -> Optional[datetime]:
@@ -101,11 +118,23 @@ def _operational_keyword_score(query: str, searchable: str) -> float:
     return min(score, 0.75)
 
 
+def _node_searchable_text(node: Dict[str, Any]) -> str:
+    props = node.get("properties", {}) or {}
+    parts = [str(node.get("id") or ""), str(node.get("label") or "")]
+    for key in ("title", "name", "content", "summary", "message", "source_file"):
+        value = props.get(key)
+        if isinstance(value, str) and value.strip():
+            parts.append(value)
+    entities = props.get("entities")
+    if isinstance(entities, list):
+        for entity in entities:
+            if isinstance(entity, dict) and entity.get("name"):
+                parts.append(str(entity["name"]))
+    return " ".join(parts).lower()
+
+
 def _keyword_score(query: str, node: Dict[str, Any]) -> float:
-    searchable = json.dumps(
-        {"label": node.get("label"), "properties": node.get("properties", {})},
-        ensure_ascii=False,
-    ).lower()
+    searchable = _node_searchable_text(node)
     query_lower = query.lower()
     score = 0.0
 
@@ -142,7 +171,7 @@ def _intent_multiplier(node: Dict[str, Any], intent: Dict[str, Any]) -> float:
             return 1.12
         return 0.96
     if primary == "causal":
-        searchable = json.dumps({"label": label, "properties": props}, ensure_ascii=False).lower()
+        searchable = _node_searchable_text(node)
         if any(term in searchable for term in ("\u539f\u56e0", "\u5bfc\u81f4", "\u56e0\u4e3a", "\u4f9d\u8d56", "caused", "cause", "depends")):
             return 1.12
         return 1.0
@@ -156,10 +185,7 @@ def _intent_multiplier(node: Dict[str, Any], intent: Dict[str, Any]) -> float:
 def _entity_overlap_multiplier(query_entities: List[Dict[str, str]], node: Dict[str, Any]) -> float:
     if not query_entities:
         return 1.0
-    searchable = json.dumps(
-        {"label": node.get("label"), "properties": node.get("properties", {})},
-        ensure_ascii=False,
-    ).lower()
+    searchable = _node_searchable_text(node)
     weights = {
         "sku": 0.28,
         "selling_point": 0.18,
@@ -192,12 +218,29 @@ def _entity_overlap_multiplier(query_entities: List[Dict[str, str]], node: Dict[
 
 def _memory_quality_multiplier(node: Dict[str, Any]) -> float:
     props = node.get("properties", {}) or {}
-    if props.get("layer") != "L0":
-        return 1.0
+    layer = props.get("layer")
+    source = props.get("source")
+    label = node.get("label") or ""
+    if layer in {"L1", "summary", "decision", "fact", "current_state"}:
+        return 1.2
+    if layer == "ops_anchor" or source == "magma_operational_anchor":
+        return 1.08
+    if layer == "entity_anchor" or label == "entity":
+        return 0.62
+    if layer != "L0":
+        return 1.03 if label == "topic" else 1.0
     role = props.get("role")
     content = str(props.get("content") or "")
     if role == "assistant":
-        return 1.04
+        multiplier = 0.98
+        lower = content.lower()
+        if "\u6ca1\u6709\u76f4\u63a5" in content or "not directly" in lower:
+            multiplier *= 0.78
+        if "\u6839\u636e\u7cfb\u7edf\u81ea\u52a8\u6ce8\u5165" in content:
+            multiplier *= 0.9
+        if any(term in content for term in ("\u4e09\u4e2a\u95ee\u9898", "\u4ee5\u4e0b\u662f\u4e09\u4e2a", "\u9010\u9879\u56de\u7b54")):
+            multiplier *= 0.92
+        return multiplier
     if role != "user":
         return 1.0
     question_terms = (
@@ -206,8 +249,29 @@ def _memory_quality_multiplier(node: Dict[str, Any]) -> float:
         "\u53ef\u4ee5\u95ee", "\u6d4b\u8bd5",
     )
     if any(term in content for term in question_terms):
-        return 0.72
-    return 0.92
+        return 0.62
+    return 0.86
+
+
+def _operational_authority_multiplier(query: str, node: Dict[str, Any], keyword_score: float) -> float:
+    if not _is_operational_query(query):
+        return 1.0
+    props = node.get("properties", {}) or {}
+    layer = props.get("layer")
+    source = props.get("source")
+    memory_scope = props.get("memory_scope")
+    label = node.get("label") or ""
+    if layer in HIGH_DENSITY_LAYERS or source == "magma_operational_anchor":
+        if keyword_score >= 0.3:
+            return 1.34
+        if keyword_score >= 0.15:
+            return 1.16
+        return 1.0
+    if label == "topic" and memory_scope == "system":
+        return 1.1 if keyword_score >= 0.2 else 1.0
+    if layer == "L0":
+        return 0.92 if keyword_score < 0.15 else 0.98
+    return 1.0
 
 
 def _lifecycle_multiplier(node: Dict[str, Any]) -> float:
@@ -326,6 +390,39 @@ def _diversify_by_scope(results: List[Dict[str, Any]], top_k: int, query_scope: 
     return selected[:top_k]
 
 
+def _promote_operational_anchor(results: List[Dict[str, Any]], top_k: int, query: str) -> List[Dict[str, Any]]:
+    if not _is_operational_query(query) or len(results) <= top_k:
+        return results[:top_k]
+    selected = results[:top_k]
+    selected_ids = {item["id"] for item in selected}
+    best_anchor = next(
+        (
+            item for item in results[: min(len(results), 30)]
+            if item["id"] not in selected_ids
+            and item.get("keyword_score", 0) >= 0.15
+            and (
+                (item.get("properties") or {}).get("layer") in HIGH_DENSITY_LAYERS
+                or (item.get("properties") or {}).get("source") == "magma_operational_anchor"
+            )
+        ),
+        None,
+    )
+    if not best_anchor:
+        return selected
+    weakest_index = min(
+        range(len(selected)),
+        key=lambda i: (
+            0 if (selected[i].get("properties") or {}).get("layer") == "L0" else 1,
+            selected[i].get("score", 0.0),
+        ),
+    )
+    weakest = selected[weakest_index]
+    if (weakest.get("properties") or {}).get("layer") == "L0" or best_anchor.get("score", 0) >= weakest.get("score", 0) * 0.72:
+        selected[weakest_index] = best_anchor
+        selected.sort(key=lambda item: item["score"], reverse=True)
+    return selected[:top_k]
+
+
 class MemorySearcher:
     """Semantic + lexical retrieval with lifecycle-aware ranking."""
 
@@ -383,6 +480,7 @@ class MemorySearcher:
             intent_scope = _intent_multiplier(node, intent)
             entity_scope = _entity_overlap_multiplier(query_entities, node)
             quality_scope = _memory_quality_multiplier(node)
+            authority_scope = _operational_authority_multiplier(query, node, keyword_score)
             combined = (
                 (semantic_score * 0.75 + keyword_score * 0.25)
                 * lifecycle
@@ -390,6 +488,7 @@ class MemorySearcher:
                 * intent_scope
                 * entity_scope
                 * quality_scope
+                * authority_scope
             )
             if combined <= 0:
                 continue
@@ -404,6 +503,7 @@ class MemorySearcher:
             node["intent_multiplier"] = round(float(intent_scope), 6)
             node["entity_overlap_multiplier"] = round(float(entity_scope), 6)
             node["memory_quality_multiplier"] = round(float(quality_scope), 6)
+            node["operational_authority_multiplier"] = round(float(authority_scope), 6)
             node["query_entities"] = query_entities
             node["query_scope"] = query_scope
             node["query_intent"] = intent
@@ -416,6 +516,7 @@ class MemorySearcher:
             results.append(node)
 
         results.sort(key=lambda item: item["score"], reverse=True)
+        results = _promote_operational_anchor(results, top_k, query)
         results = _diversify_by_scope(results, top_k, query_scope)
         if include_related:
             for item in results:

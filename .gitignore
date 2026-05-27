@@ -8,6 +8,10 @@ data/
 # Backups
 backups/
 
+# Local model caches and runtime logs
+models/
+logs/
+
 # Python
 __pycache__/
 *.pyc

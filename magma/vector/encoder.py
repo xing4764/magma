@@ -7,16 +7,16 @@ from typing import List, Union
 # Use the official Hub by default. Set HF_ENDPOINT explicitly when a mirror is needed.
 os.environ.setdefault("HF_ENDPOINT", "https://huggingface.co")
 
-_model = None
+_models = {}
 _MODEL_NAME = os.environ.get("MAGMA_EMBEDDING_MODEL", "BAAI/bge-small-zh-v1.5")
 
 
-def _get_model():
-    global _model
-    if _model is None:
+def _get_model(model_name: str = _MODEL_NAME):
+    model_name = model_name or _MODEL_NAME
+    if model_name not in _models:
         from sentence_transformers import SentenceTransformer
-        _model = SentenceTransformer(_MODEL_NAME)
-    return _model
+        _models[model_name] = SentenceTransformer(model_name)
+    return _models[model_name]
 
 
 class Encoder:
@@ -29,8 +29,7 @@ class Encoder:
     @property
     def model(self):
         if self._model is None:
-            from sentence_transformers import SentenceTransformer
-            self._model = SentenceTransformer(self.model_name)
+            self._model = _get_model(self.model_name)
         return self._model
 
     def encode(self, texts: Union[str, List[str]], normalize: bool = True) -> np.ndarray:

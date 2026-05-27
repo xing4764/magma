@@ -14,6 +14,7 @@ import subprocess
 import sys
 import urllib.request
 import urllib.error
+from urllib.parse import urlparse
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
@@ -21,11 +22,28 @@ if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-API_BASE = os.environ.get("MAGMA_API_BASE", "http://127.0.0.1:8902").rstrip("/")
 PROJECT_ROOT = Path(__file__).parent.parent
+OPENCLAW_CONFIG = Path.home() / ".openclaw" / "openclaw.json"
+
+
+def _configured_api_base() -> str:
+    env_base = os.environ.get("MAGMA_API_BASE")
+    if env_base:
+        return env_base.rstrip("/")
+    try:
+        text = OPENCLAW_CONFIG.read_text(encoding="utf-8", errors="ignore")
+        match = re.search(r'"apiBaseUrl"\s*:\s*"(http://127\.0\.0\.1:\d+)"', text)
+        if match:
+            return match.group(1).rstrip("/")
+    except OSError:
+        pass
+    return "http://127.0.0.1:8902"
+
+
+API_BASE = _configured_api_base()
+API_PORT = int(urlparse(API_BASE).port or 8902)
 DB_PATH = Path(os.environ.get("MAGMA_DB_PATH", str(PROJECT_ROOT / "data" / "magma.db")))
 MCP_SERVER = PROJECT_ROOT / "magma" / "api" / "mcp_server.py"
-OPENCLAW_CONFIG = Path.home() / ".openclaw" / "openclaw.json"
 OPENCLAW_NPM_PACKAGE = Path.home() / ".openclaw" / "npm" / "package.json"
 TIMEOUT_S = 5
 CST = timezone(timedelta(hours=8))
@@ -160,15 +178,15 @@ def cmd_repair():
     issues = []
     actions = []
 
-    # 1. Check 8902 port
-    print("\n[1/5] Checking 8902 port...")
-    port_ok = _check_port(8902)
+    # 1. Check configured API port
+    print(f"\n[1/5] Checking MAGMA API port {API_PORT}...")
+    port_ok = _check_port(API_PORT)
     if port_ok:
-        print("  Port 8902 is listening")
+        print(f"  Port {API_PORT} is listening")
     else:
-        print("  Port 8902 is NOT listening")
-        issues.append("8902 API not running")
-        actions.append("Start MAGMA API: python -m magma.api.server (port 8902)")
+        print(f"  Port {API_PORT} is NOT listening")
+        issues.append(f"{API_PORT} API not running")
+        actions.append(f"Start MAGMA API with MAGMA_API_PORT={API_PORT}: python -m magma.api.server")
 
     # 2. Check API health
     print("\n[2/5] Checking API health...")
