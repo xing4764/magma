@@ -59,6 +59,17 @@
         "type": "string",
         "default": ""
       },
+      "embeddingModel": {
+        "type": "string",
+        "default": ""
+      },
+      "apiEnv": {
+        "type": "object",
+        "additionalProperties": {
+          "type": "string"
+        },
+        "default": {}
+      },
       "excludeAgents": {
         "type": "array",
         "items": {

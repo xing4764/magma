@@ -22,13 +22,13 @@ MAGMA 是面向 OpenClaw 多 Agent 系统的跨会话、跨 Agent 记忆架构�
 
 ## 当前运行态
 
-- Embedding 模型：本地 `BAAI/bge-small-zh-v1.5`
-- Embedding 维度：512
+- Embedding 模型：本地 `Qwen3-Embedding-0.6B`
+- Embedding 维度：1024
 - 慢路径 LLM 后端：DeepSeek V3 via OpenRouter
 - 主 API：`http://127.0.0.1:8902`
 - MCP 服务：指向 8902 主 API 的薄代理
 
-LLM 后端和 embedding 模型是两套东西，不能混用。DeepSeek V3 用于慢路径关系抽取、因果推断和记忆巩固；`bge-small-zh-v1.5` 用于本地语义向量召回。历史上的 MiniLM-L6-v2 / 384 维向量不是当前运行态。
+LLM 后端和 embedding 模型是两套东西，不能混用。DeepSeek V3 用于慢路径关系抽取、因果推断和记忆巩固；`Qwen3-Embedding-0.6B` 用于本地语义向量召回。历史上的 MiniLM-L6-v2 / 384 维向量和 bge-small-zh-v1.5 / 512 维向量不是当前运行态。
 
 ## 可用性边界
 
@@ -166,6 +166,10 @@ openclaw-plugin-magma-recall/
           "timeoutMs": 12000,
           "scoreThreshold": 0.35,
           "magmaCwd": "C:\\openclaw-magma",
+          "embeddingModel": "C:\\openclaw-magma\\models\\Qwen\\Qwen3-Embedding-0___6B",
+          "apiEnv": {
+            "MAGMA_EMBEDDING_MODEL": "C:\\openclaw-magma\\models\\Qwen\\Qwen3-Embedding-0___6B"
+          },
           "capture": {
             "enabled": true,
             "ttlDays": 180,
@@ -219,6 +223,9 @@ python scripts\magma_recall_eval.py
 # Qwen3 embedding 旁路评估，不修改生产数据
 python scripts\qwen_embedding_probe.py --model .\models\Qwen\Qwen3-Embedding-0___6B
 
+# Qwen3 embedding 生产切换前的独立试用库构建
+python scripts\qwen_embedding_trial.py --port 8905
+
 # Qwen3 reranker 旁路评估，不接入实时召回
 python scripts\qwen_reranker_probe.py --candidate-k 20 --top-k 6
 ```
@@ -227,12 +234,12 @@ python scripts\qwen_reranker_probe.py --candidate-k 20 --top-k 6
 
 MAGMA 的实时召回链路默认保持轻量：
 
-1. `BAAI/bge-small-zh-v1.5` 负责快速向量召回。
+1. `Qwen3-Embedding-0.6B` 负责第一阶段向量召回。
 2. 中文关键词、生命周期、source agent、importance 和 current-state 信号做规则重排。
 3. `ops_anchor`、`L1`、`current_state` 等高密度记忆在运维和架构类问题中优先。
 4. L0 原始对话保留为证据，但不会轻易压过高密度记忆。
 
-`Qwen3-Embedding-0.6B` 和 `Qwen3-Reranker-0.6B` 目前作为旁路评估工具使用。实测 CPU 环境下 reranker 对 top20 候选精排会达到数十秒级，不适合放进 `before_prompt_build` 实时链路；它更适合离线质量审计、慢路径治理和后续 L1 提炼评估。
+`Qwen3-Reranker-0.6B` 目前只作为旁路评估工具使用。实测 CPU 环境下 reranker 对 top20 候选精排会达到数十秒级，不适合放进 `before_prompt_build` 实时链路；它更适合离线质量审计、慢路径治理和后续 L1 提炼评估。
 
 ## 数据安全
 

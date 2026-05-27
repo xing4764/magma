@@ -79,7 +79,7 @@ Use `source_agent_id` and `department` for cross-agent filtering, QA, and memory
 
 The realtime recall path must stay fast because it runs before prompt build:
 
-- Keep `bge-small-zh-v1.5` as the default first-stage embedding model unless an A/B test proves a replacement is better.
+- Keep `Qwen3-Embedding-0.6B` as the default first-stage embedding model. Production embeddings should be 1024-dimensional; if they are 512-dimensional, rerun `magma_cli.py reembed` with the configured Qwen model.
 - Prefer high-density `ops_anchor`, `L1`, `decision`, `fact`, and `current_state` memories for operational questions.
 - Keep L0 raw chat memories as evidence, but do not let generic chat fragments dominate high-signal anchors.
 - Use `scripts/qwen_embedding_probe.py` and `scripts/qwen_reranker_probe.py` for offline A/B tests only.

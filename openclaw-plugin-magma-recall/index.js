@@ -35,6 +35,8 @@ function resolveConfig(raw = {}) {
     autoStartApi: raw.autoStartApi !== false,
     python: String(raw.python || "python"),
     magmaCwd: String(raw.magmaCwd || DEFAULT_MAGMA_CWD),
+    embeddingModel: raw.embeddingModel ? String(raw.embeddingModel) : "",
+    apiEnv: raw.apiEnv && typeof raw.apiEnv === "object" && !Array.isArray(raw.apiEnv) ? raw.apiEnv : {},
     excludeAgents: Array.isArray(raw.excludeAgents) ? raw.excludeAgents.map(String) : [],
   };
 }
@@ -110,8 +112,10 @@ async function ensureApiStarted(cfg, logger) {
     windowsHide: true,
     env: {
       ...process.env,
+      ...Object.fromEntries(Object.entries(cfg.apiEnv).map(([key, value]) => [key, String(value)])),
       HF_ENDPOINT: process.env.HF_ENDPOINT || "https://huggingface.co",
       MAGMA_API_PORT: parseApiPort(cfg.apiBaseUrl),
+      ...(cfg.embeddingModel ? { MAGMA_EMBEDDING_MODEL: cfg.embeddingModel } : {}),
     },
   });
   child.unref();
