@@ -33,3 +33,23 @@ venv/
 # OS
 Thumbs.db
 .DS_Store
+
+# One-time scripts (diagnostics, fixes, benchmarks, tests, profiles)
+scripts/check_*.py
+scripts/fix_*.py
+scripts/test_*.py
+scripts/benchmark_*.py
+scripts/profile_*.py
+scripts/full_audit.py
+scripts/latency_test.py
+scripts/magma_l1_distill.py
+scripts/magma_l1_distill_llm.py
+
+# Backup files
+*.pre-fix
+
+# Local startup scripts
+start_server.bat
+
+# Non-core docs
+起源于.md

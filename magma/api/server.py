@@ -120,6 +120,11 @@ class EdgeRequest(BaseModel):
     properties: Optional[dict] = None
 
 
+class EntitySearchRequest(BaseModel):
+    entity_name: str
+    entity_type: Optional[str] = None
+
+
 class QueryResponse(BaseModel):
     query: str
     results: list
@@ -150,6 +155,7 @@ def create_app() -> FastAPI:
     async def startup():
         from magma.graph.sqlite_store import get_store
         from magma.vector.encoder import Encoder
+        from magma.vector.faiss_index import get_faiss_index
 
         store = get_store()
         store.initialize()
@@ -164,6 +170,37 @@ def create_app() -> FastAPI:
         except Exception as e:
             app.state.encoder = None
             logger.warning(f"Encoder pre-warm failed: {e}")
+
+        # Pre-warm jieba to avoid cold-start on first query
+        try:
+            import jieba
+            jieba_userdict = Path(project_root) / "config" / "jieba_userdict.txt"
+            if jieba_userdict.exists():
+                jieba.load_userdict(str(jieba_userdict))
+                logger.info(f"jieba user dict loaded: {jieba_userdict}")
+            jieba.lcut("预热")
+            logger.info("jieba pre-warmed")
+        except Exception:
+            pass
+
+        # Build FAISS index at startup
+        try:
+            faiss_idx = get_faiss_index(getattr(encoder, 'dimension', 0) if app.state.encoder else 0)
+            app.state.faiss_index = faiss_idx
+            all_nodes = store.query_nodes_with_embeddings(limit=999999, include_archived=True)
+            entries = []
+            import numpy as _np
+            for node in all_nodes:
+                blob = node.get("embedding")
+                if blob:
+                    vec = _np.frombuffer(blob, dtype=_np.float32)
+                    if vec.ndim == 1 and vec.shape[0] > 0:
+                        entries.append((node["id"], vec))
+            faiss_idx.build_from_embeddings(entries)
+            logger.info(f"FAISS index built with {len(entries)} vectors, dim={faiss_idx.dimension}")
+        except Exception as e:
+            app.state.faiss_index = None
+            logger.warning(f"FAISS index build failed: {e}")
 
         interval = int(os.environ.get("MAGMA_CONSOLIDATE_INTERVAL_SECONDS", "3600"))
         if interval > 0:
@@ -188,6 +225,18 @@ def create_app() -> FastAPI:
     async def health():
         return {"status": "ok", "service": "magma", "version": "0.1.0"}
 
+    @app.get("/api/v1/doctor")
+    async def doctor():
+        from magma.graph.sqlite_store import get_store
+        store = getattr(app.state, "store", None) or get_store()
+        return store.get_doctor()
+
+    @app.get("/api/v1/stats")
+    async def stats():
+        from magma.graph.sqlite_store import get_store
+        store = getattr(app.state, "store", None) or get_store()
+        return store.get_stats()
+
     @app.post("/api/v1/query", response_model=QueryResponse)
     async def query(req: QueryRequest):
         from magma.graph.sqlite_store import get_store
@@ -196,7 +245,8 @@ def create_app() -> FastAPI:
 
         store = getattr(app.state, "store", None) or get_store()
         encoder = getattr(app.state, "encoder", None) or Encoder()
-        results = MemorySearcher(store, encoder).query(req.query, req.top_k, req.filters)
+        faiss_index = getattr(app.state, "faiss_index", None)
+        results = MemorySearcher(store, encoder, faiss_index).query(req.query, req.top_k, req.filters)
         if not results:
             results = [{
                 "id": "system",
@@ -221,6 +271,15 @@ def create_app() -> FastAPI:
 
         store.add_node(req.id, req.label, properties, embedding)
         _attach_entity_anchors(store, encoder, req.id, text_for_embedding, properties.get("source", "api"))
+
+        # Incrementally update FAISS index
+        faiss_index = getattr(app.state, "faiss_index", None)
+        if faiss_index and embedding is not None:
+            try:
+                faiss_index.add(req.id, embedding)
+            except Exception as e:
+                logger.warning(f"FAISS incremental add failed: {e}")
+
         return {"status": "ok", "id": req.id}
 
     @app.post("/api/v1/capture")
@@ -264,6 +323,15 @@ def create_app() -> FastAPI:
             embedding = encoder.encode(text_for_embedding).astype("float32")
             store.add_node(node_id, "event", properties, embedding)
             _attach_entity_anchors(store, encoder, node_id, cleaned, req.source)
+
+            # Incrementally update FAISS index
+            faiss_index = getattr(app.state, "faiss_index", None)
+            if faiss_index and embedding is not None:
+                try:
+                    faiss_index.add(node_id, embedding)
+                except Exception as e:
+                    logger.warning(f"FAISS incremental add failed: {e}")
+
             written.append(node_id)
 
         if len(written) == 2:
@@ -301,6 +369,26 @@ def create_app() -> FastAPI:
         edges = store.get_edges(node_id)
         return {"node": node, "edges": edges}
 
+    @app.patch("/api/v1/nodes/{node_id}")
+    async def update_node(node_id: str, body: dict):
+        from magma.graph.sqlite_store import get_store
+
+        store = getattr(app.state, "store", None) or get_store()
+        # Accept both {"properties": {...}} and flat {...}
+        properties = body.get("properties", body)
+        if not store.update_node(node_id, properties):
+            raise HTTPException(status_code=404, detail=f"Node {node_id} not found")
+        return {"status": "ok", "id": node_id}
+
+    @app.delete("/api/v1/nodes/{node_id}")
+    async def delete_node(node_id: str):
+        from magma.graph.sqlite_store import get_store
+
+        store = getattr(app.state, "store", None) or get_store()
+        if not store.delete_node(node_id):
+            raise HTTPException(status_code=404, detail=f"Node {node_id} not found")
+        return {"status": "ok", "id": node_id}
+
     @app.post("/api/v1/consolidate")
     async def consolidate():
         from magma.graph.sqlite_store import get_store
@@ -320,6 +408,22 @@ def create_app() -> FastAPI:
             keep_days=keep_days,
             keep_latest=keep_latest,
         )}
+
+    @app.post("/api/v1/search_by_entity")
+    async def search_by_entity(req: EntitySearchRequest):
+        from magma.graph.sqlite_store import get_store
+
+        store = getattr(app.state, "store", None) or get_store()
+        nodes = store.query_nodes(label="entity", limit=100)
+        results = []
+        name_lower = req.entity_name.lower()
+        for node in nodes:
+            props = node.get("properties", {}) or {}
+            if props.get("name", "").lower() == name_lower:
+                if req.entity_type and props.get("entity_type") != req.entity_type:
+                    continue
+                results.append(node)
+        return {"results": results, "count": len(results)}
 
     @app.post("/api/v1/feedback")
     async def feedback(req: FeedbackRequest):

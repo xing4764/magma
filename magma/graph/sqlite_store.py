@@ -3,6 +3,7 @@
 import sqlite3
 import json
 import os
+import threading
 from pathlib import Path
 from typing import Optional, Dict, Any, List
 
@@ -17,6 +18,7 @@ class SQLiteStore:
     def __init__(self, db_path: str = DB_PATH):
         self.db_path = db_path
         self._conn: Optional[sqlite3.Connection] = None
+        self._write_lock = threading.Lock()
 
     def initialize(self):
         """Create tables if not exist."""
@@ -112,52 +114,107 @@ class SQLiteStore:
         status = properties.get("status", "active")
         source_agent_id = properties.get("source_agent_id")
         department = properties.get("department")
-        self._conn.execute(
-            """
-            INSERT INTO nodes (
-                id, label, properties, embedding, updated_at, importance,
-                ttl_days, valid_from, valid_until, status,
-                source_agent_id, department
+        with self._write_lock:
+            self._conn.execute(
+                """
+                INSERT INTO nodes (
+                    id, label, properties, embedding, updated_at, importance,
+                    ttl_days, valid_from, valid_until, status,
+                    source_agent_id, department
+                )
+                VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    label = excluded.label,
+                    properties = excluded.properties,
+                    embedding = excluded.embedding,
+                    updated_at = CURRENT_TIMESTAMP,
+                    importance = excluded.importance,
+                    ttl_days = excluded.ttl_days,
+                    valid_from = excluded.valid_from,
+                    valid_until = excluded.valid_until,
+                    status = excluded.status,
+                    source_agent_id = excluded.source_agent_id,
+                    department = excluded.department
+                """,
+                (node_id, label, props, emb, importance, ttl_days, valid_from, valid_until, status,
+                 source_agent_id, department)
             )
-            VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(id) DO UPDATE SET
-                label = excluded.label,
-                properties = excluded.properties,
-                embedding = excluded.embedding,
-                updated_at = CURRENT_TIMESTAMP,
-                importance = excluded.importance,
-                ttl_days = excluded.ttl_days,
-                valid_from = excluded.valid_from,
-                valid_until = excluded.valid_until,
-                status = excluded.status,
-                source_agent_id = excluded.source_agent_id,
-                department = excluded.department
-            """,
-            (node_id, label, props, emb, importance, ttl_days, valid_from, valid_until, status,
-             source_agent_id, department)
-        )
-        self._conn.commit()
+            self._conn.commit()
 
     def add_edge(self, source_id: str, target_id: str, relation: str, properties: Dict = None):
         props = json.dumps(properties or {}, ensure_ascii=False)
-        self._conn.execute(
-            "INSERT INTO edges (source_id, target_id, relation, properties) VALUES (?, ?, ?, ?)",
-            (source_id, target_id, relation, props)
-        )
-        self._conn.commit()
+        with self._write_lock:
+            self._conn.execute(
+                "INSERT INTO edges (source_id, target_id, relation, properties) VALUES (?, ?, ?, ?)",
+                (source_id, target_id, relation, props)
+            )
+            self._conn.commit()
 
     def add_edge_once(self, source_id: str, target_id: str, relation: str, properties: Dict = None):
-        cur = self._conn.execute(
-            """
-            SELECT 1 FROM edges
-             WHERE source_id = ? AND target_id = ? AND relation = ?
-             LIMIT 1
-            """,
-            (source_id, target_id, relation)
-        )
-        if cur.fetchone():
-            return
-        self.add_edge(source_id, target_id, relation, properties)
+        with self._write_lock:
+            cur = self._conn.execute(
+                """
+                SELECT 1 FROM edges
+                 WHERE source_id = ? AND target_id = ? AND relation = ?
+                 LIMIT 1
+                """,
+                (source_id, target_id, relation)
+            )
+            if cur.fetchone():
+                return
+            props = json.dumps(properties or {}, ensure_ascii=False)
+            self._conn.execute(
+                "INSERT INTO edges (source_id, target_id, relation, properties) VALUES (?, ?, ?, ?)",
+                (source_id, target_id, relation, props)
+            )
+            self._conn.commit()
+
+    def update_node(self, node_id: str, properties: Dict[str, Any]) -> bool:
+        """Partial update of node properties. Returns True if node existed."""
+        cur = self._conn.execute("SELECT properties FROM nodes WHERE id = ?", (node_id,))
+        row = cur.fetchone()
+        if not row:
+            return False
+        existing = json.loads(row["properties"])
+        existing.update(properties)
+        props_json = json.dumps(existing, ensure_ascii=False)
+        importance = float(existing.get("importance", 0.5) or 0.5)
+        ttl_days = existing.get("ttl_days")
+        valid_from = existing.get("valid_from")
+        valid_until = existing.get("valid_until")
+        status = existing.get("status", "active")
+        source_agent_id = existing.get("source_agent_id")
+        department = existing.get("department")
+        with self._write_lock:
+            self._conn.execute(
+                """
+                UPDATE nodes
+                   SET properties = ?,
+                       importance = ?,
+                       ttl_days = ?,
+                       valid_from = ?,
+                       valid_until = ?,
+                       status = ?,
+                       source_agent_id = ?,
+                       department = ?,
+                       updated_at = CURRENT_TIMESTAMP
+                 WHERE id = ?
+                """,
+                (props_json, importance, ttl_days, valid_from, valid_until,
+                 status, source_agent_id, department, node_id)
+            )
+            self._conn.commit()
+        return True
+
+    def delete_node(self, node_id: str) -> bool:
+        """Soft-delete a node by setting status='deleted'. Returns True if node existed."""
+        with self._write_lock:
+            cur = self._conn.execute(
+                "UPDATE nodes SET status = 'deleted', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (node_id,)
+            )
+            self._conn.commit()
+            return cur.rowcount > 0
 
     def get_node(self, node_id: str) -> Optional[Dict]:
         cur = self._conn.execute(
@@ -236,7 +293,9 @@ class SQLiteStore:
             SELECT id, label, properties, embedding, created_at, updated_at,
                    last_accessed_at, access_count, importance, ttl_days,
                    valid_from, valid_until, status, source_agent_id, department
-            FROM nodes WHERE {where_sql} LIMIT ?
+            FROM nodes WHERE {where_sql}
+            ORDER BY created_at DESC
+            LIMIT ?
             """,
             tuple(params)
         )
@@ -248,14 +307,62 @@ class SQLiteStore:
             nodes.append(node)
         return nodes
 
+    def query_nodes_properties_only(
+        self,
+        label: str = None,
+        limit: int = 1000,
+        include_archived: bool = False,
+        property_filters: Dict[str, Any] = None,
+    ) -> List[Dict]:
+        """Query nodes WITHOUT loading embedding BLOBs (faster when FAISS provides semantics)."""
+        where = []
+        params = []
+        if not include_archived:
+            where.extend([
+                "status = 'active'",
+                "(valid_until IS NULL OR datetime(valid_until) >= CURRENT_TIMESTAMP)",
+                "(ttl_days IS NULL OR datetime(created_at, '+' || ttl_days || ' days') >= CURRENT_TIMESTAMP)",
+            ])
+        if label:
+            where.append("label = ?")
+            params.append(label)
+        for key, value in (property_filters or {}).items():
+            if value is None:
+                continue
+            if isinstance(value, (list, tuple, set)):
+                values = [item for item in value if item is not None]
+                if not values:
+                    continue
+                placeholders = ", ".join("?" for _ in values)
+                where.append(f"json_extract(properties, '$.{key}') IN ({placeholders})")
+                params.extend(values)
+            else:
+                where.append(f"json_extract(properties, '$.{key}') = ?")
+                params.append(value)
+        where_sql = " AND ".join(where) if where else "1 = 1"
+        params.append(limit)
+        cur = self._conn.execute(
+            f"""
+            SELECT id, label, properties, created_at, updated_at,
+                   last_accessed_at, access_count, importance, ttl_days,
+                   valid_from, valid_until, status, source_agent_id, department
+            FROM nodes WHERE {where_sql}
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            tuple(params)
+        )
+        return [self._row_to_node(r) for r in cur.fetchall()]
+
     def touch_nodes(self, node_ids: List[str]):
         if not node_ids:
             return
-        self._conn.executemany(
-            "UPDATE nodes SET last_accessed_at = CURRENT_TIMESTAMP, access_count = access_count + 1 WHERE id = ?",
-            [(node_id,) for node_id in node_ids]
-        )
-        self._conn.commit()
+        with self._write_lock:
+            self._conn.executemany(
+                "UPDATE nodes SET last_accessed_at = CURRENT_TIMESTAMP, access_count = access_count + 1 WHERE id = ?",
+                [(node_id,) for node_id in node_ids]
+            )
+            self._conn.commit()
 
     def record_recall_event(
         self,
@@ -268,21 +375,22 @@ class SQLiteStore:
         department: str = None,
     ):
         payload = json.dumps(results or [], ensure_ascii=False)
-        self._conn.execute(
-            """
-            INSERT INTO recall_events (id, query, agent_id, session_key, results, source_agent_id, department)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(id) DO UPDATE SET
-                query = excluded.query,
-                agent_id = excluded.agent_id,
-                session_key = excluded.session_key,
-                results = excluded.results,
-                source_agent_id = excluded.source_agent_id,
-                department = excluded.department
-            """,
-            (event_id, query, agent_id, session_key, payload, source_agent_id, department)
-        )
-        self._conn.commit()
+        with self._write_lock:
+            self._conn.execute(
+                """
+                INSERT INTO recall_events (id, query, agent_id, session_key, results, source_agent_id, department)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    query = excluded.query,
+                    agent_id = excluded.agent_id,
+                    session_key = excluded.session_key,
+                    results = excluded.results,
+                    source_agent_id = excluded.source_agent_id,
+                    department = excluded.department
+                """,
+                (event_id, query, agent_id, session_key, payload, source_agent_id, department)
+            )
+            self._conn.commit()
 
     def apply_recall_feedback(
         self,
@@ -297,49 +405,50 @@ class SQLiteStore:
         recalled = list(dict.fromkeys(recalled_node_ids or []))
         used = set(used_node_ids or [])
         updates = []
-        for node_id in recalled:
-            signal = "used" if node_id in used else "unused"
-            delta = positive_delta if signal == "used" else unused_delta
-            cur = self._conn.execute("SELECT importance FROM nodes WHERE id = ?", (node_id,))
-            row = cur.fetchone()
-            if not row:
-                continue
-            old = float(row["importance"] or 0.5)
-            new = min(max(old + delta, 0.05), 1.0)
+        with self._write_lock:
+            for node_id in recalled:
+                signal = "used" if node_id in used else "unused"
+                delta = positive_delta if signal == "used" else unused_delta
+                cur = self._conn.execute("SELECT importance FROM nodes WHERE id = ?", (node_id,))
+                row = cur.fetchone()
+                if not row:
+                    continue
+                old = float(row["importance"] or 0.5)
+                new = min(max(old + delta, 0.05), 1.0)
+                self._conn.execute(
+                    """
+                    UPDATE nodes
+                       SET importance = ?,
+                           properties = json_set(properties, '$.importance', ?),
+                           updated_at = CURRENT_TIMESTAMP
+                     WHERE id = ?
+                    """,
+                    (new, new, node_id)
+                )
+                self._conn.execute(
+                    """
+                    INSERT INTO recall_feedback (event_id, node_id, signal, delta, old_importance, new_importance, source_agent_id, department)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (event_id, node_id, signal, delta, old, new, source_agent_id, department)
+                )
+                updates.append({
+                    "node_id": node_id,
+                    "signal": signal,
+                    "delta": round(delta, 6),
+                    "old_importance": round(old, 6),
+                    "new_importance": round(new, 6),
+                })
             self._conn.execute(
                 """
-                UPDATE nodes
-                   SET importance = ?,
-                       properties = json_set(properties, '$.importance', ?),
-                       updated_at = CURRENT_TIMESTAMP
+                UPDATE recall_events
+                   SET used_node_ids = ?,
+                       feedback_at = CURRENT_TIMESTAMP
                  WHERE id = ?
                 """,
-                (new, new, node_id)
+                (json.dumps(sorted(used), ensure_ascii=False), event_id)
             )
-            self._conn.execute(
-                """
-                INSERT INTO recall_feedback (event_id, node_id, signal, delta, old_importance, new_importance, source_agent_id, department)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (event_id, node_id, signal, delta, old, new, source_agent_id, department)
-            )
-            updates.append({
-                "node_id": node_id,
-                "signal": signal,
-                "delta": round(delta, 6),
-                "old_importance": round(old, 6),
-                "new_importance": round(new, 6),
-            })
-        self._conn.execute(
-            """
-            UPDATE recall_events
-               SET used_node_ids = ?,
-                   feedback_at = CURRENT_TIMESTAMP
-             WHERE id = ?
-            """,
-            (json.dumps(sorted(used), ensure_ascii=False), event_id)
-        )
-        self._conn.commit()
+            self._conn.commit()
         return {
             "event_id": event_id,
             "recalled": len(recalled),
@@ -348,85 +457,86 @@ class SQLiteStore:
         }
 
     def consolidate(self) -> Dict[str, int]:
-        cur = self._conn.execute("""
-            DELETE FROM edges WHERE id NOT IN (
-                SELECT MIN(id) FROM edges GROUP BY source_id, target_id, relation
-            )
-        """)
-        removed_edges = cur.rowcount
+        with self._write_lock:
+            cur = self._conn.execute("""
+                DELETE FROM edges WHERE id NOT IN (
+                    SELECT MIN(id) FROM edges GROUP BY source_id, target_id, relation
+                )
+            """)
+            removed_edges = cur.rowcount
 
-        cur = self._conn.execute("""
-            DELETE FROM edges WHERE source_id NOT IN (SELECT id FROM nodes)
-               OR target_id NOT IN (SELECT id FROM nodes)
-        """)
-        orphan_edges = cur.rowcount
+            cur = self._conn.execute("""
+                DELETE FROM edges WHERE source_id NOT IN (SELECT id FROM nodes)
+                   OR target_id NOT IN (SELECT id FROM nodes)
+            """)
+            orphan_edges = cur.rowcount
 
-        cur = self._conn.execute("""
-            UPDATE nodes
-               SET status = 'stale'
-             WHERE status = 'active'
-               AND ttl_days IS NOT NULL
-               AND datetime(created_at, '+' || ttl_days || ' days') < CURRENT_TIMESTAMP
-        """)
-        expired_nodes = cur.rowcount
+            cur = self._conn.execute("""
+                UPDATE nodes
+                   SET status = 'stale'
+                 WHERE status = 'active'
+                   AND ttl_days IS NOT NULL
+                   AND datetime(created_at, '+' || ttl_days || ' days') < CURRENT_TIMESTAMP
+            """)
+            expired_nodes = cur.rowcount
 
-        cur = self._conn.execute("""
-            UPDATE nodes
-               SET status = 'stale'
-             WHERE status = 'active'
-               AND importance < 0.2
-               AND access_count = 0
-               AND datetime(created_at, '+90 days') < CURRENT_TIMESTAMP
-        """)
-        low_importance_nodes = cur.rowcount
+            cur = self._conn.execute("""
+                UPDATE nodes
+                   SET status = 'stale'
+                 WHERE status = 'active'
+                   AND importance < 0.2
+                   AND access_count = 0
+                   AND datetime(created_at, '+90 days') < CURRENT_TIMESTAMP
+            """)
+            low_importance_nodes = cur.rowcount
 
-        cur = self._conn.execute("""
-            SELECT properties, COUNT(*) as cnt, GROUP_CONCAT(id) as ids
-            FROM nodes WHERE label != 'event' AND status != 'deleted'
-            GROUP BY properties HAVING cnt > 1
-        """)
-        duplicates = cur.fetchall()
-        merged = 0
-        for row in duplicates:
-            ids = row["ids"].split(",")
-            keep_id = ids[0]
-            for remove_id in ids[1:]:
-                self._conn.execute("UPDATE edges SET source_id = ? WHERE source_id = ?", (keep_id, remove_id))
-                self._conn.execute("UPDATE edges SET target_id = ? WHERE target_id = ?", (keep_id, remove_id))
-                self._add_same_as_edge(remove_id, keep_id, {"reason": "duplicate_properties"})
-                self._conn.execute("UPDATE nodes SET status = 'deleted' WHERE id = ?", (remove_id,))
-                merged += 1
+            cur = self._conn.execute("""
+                SELECT properties, COUNT(*) as cnt, GROUP_CONCAT(id) as ids
+                FROM nodes WHERE label != 'event' AND status != 'deleted'
+                GROUP BY properties HAVING cnt > 1
+            """)
+            duplicates = cur.fetchall()
+            merged = 0
+            for row in duplicates:
+                ids = row["ids"].split(",")
+                keep_id = ids[0]
+                for remove_id in ids[1:]:
+                    self._conn.execute("UPDATE edges SET source_id = ? WHERE source_id = ?", (keep_id, remove_id))
+                    self._conn.execute("UPDATE edges SET target_id = ? WHERE target_id = ?", (keep_id, remove_id))
+                    self._add_same_as_edge(remove_id, keep_id, {"reason": "duplicate_properties"})
+                    self._conn.execute("UPDATE nodes SET status = 'deleted' WHERE id = ?", (remove_id,))
+                    merged += 1
 
-        cur = self._conn.execute("""
-            SELECT
-                COALESCE(json_extract(properties, '$.source'), '') as source,
-                COALESCE(json_extract(properties, '$.agent_id'), '') as agent_id,
-                COALESCE(json_extract(properties, '$.session_key'), '') as session_key,
-                COALESCE(json_extract(properties, '$.role'), '') as role,
-                COALESCE(json_extract(properties, '$.content'), '') as content,
-                COUNT(*) as cnt,
-                GROUP_CONCAT(id) as ids
-            FROM nodes
-            WHERE label = 'event'
-              AND status != 'deleted'
-              AND json_extract(properties, '$.layer') = 'L0'
-              AND COALESCE(json_extract(properties, '$.content'), '') != ''
-            GROUP BY source, agent_id, session_key, role, content
-            HAVING cnt > 1
-        """)
-        l0_duplicates = cur.fetchall()
-        merged_l0 = 0
-        for row in l0_duplicates:
-            ids = row["ids"].split(",")
-            keep_id = ids[0]
-            for remove_id in ids[1:]:
-                self._conn.execute("UPDATE edges SET source_id = ? WHERE source_id = ?", (keep_id, remove_id))
-                self._conn.execute("UPDATE edges SET target_id = ? WHERE target_id = ?", (keep_id, remove_id))
-                self._add_same_as_edge(remove_id, keep_id, {"reason": "duplicate_l0_content"})
-                self._conn.execute("UPDATE nodes SET status = 'deleted' WHERE id = ?", (remove_id,))
-                merged_l0 += 1
+            cur = self._conn.execute("""
+                SELECT
+                    COALESCE(json_extract(properties, '$.source'), '') as source,
+                    COALESCE(json_extract(properties, '$.agent_id'), '') as agent_id,
+                    COALESCE(json_extract(properties, '$.session_key'), '') as session_key,
+                    COALESCE(json_extract(properties, '$.role'), '') as role,
+                    COALESCE(json_extract(properties, '$.content'), '') as content,
+                    COUNT(*) as cnt,
+                    GROUP_CONCAT(id) as ids
+                FROM nodes
+                WHERE label = 'event'
+                  AND status != 'deleted'
+                  AND json_extract(properties, '$.layer') = 'L0'
+                  AND COALESCE(json_extract(properties, '$.content'), '') != ''
+                GROUP BY source, agent_id, session_key, role, content
+                HAVING cnt > 1
+            """)
+            l0_duplicates = cur.fetchall()
+            merged_l0 = 0
+            for row in l0_duplicates:
+                ids = row["ids"].split(",")
+                keep_id = ids[0]
+                for remove_id in ids[1:]:
+                    self._conn.execute("UPDATE edges SET source_id = ? WHERE source_id = ?", (keep_id, remove_id))
+                    self._conn.execute("UPDATE edges SET target_id = ? WHERE target_id = ?", (keep_id, remove_id))
+                    self._add_same_as_edge(remove_id, keep_id, {"reason": "duplicate_l0_content"})
+                    self._conn.execute("UPDATE nodes SET status = 'deleted' WHERE id = ?", (remove_id,))
+                    merged_l0 += 1
 
-        self._conn.commit()
+            self._conn.commit()
         return {
             "removed_duplicate_edges": removed_edges,
             "removed_orphan_edges": orphan_edges,
@@ -568,6 +678,52 @@ class SQLiteStore:
                 "relative": "newer" if str(row["updated_at"]) > str(node.get("updated_at")) else "older_or_peer",
             })
         return versions
+
+    def get_stats(self) -> Dict[str, Any]:
+        """Return node/edge counts and layer distribution."""
+        node_count = self._conn.execute(
+            "SELECT COUNT(*) as cnt FROM nodes WHERE status != 'deleted'"
+        ).fetchone()["cnt"]
+        edge_count = self._conn.execute(
+            "SELECT COUNT(*) as cnt FROM edges"
+        ).fetchone()["cnt"]
+        capture_24h = self._conn.execute(
+            "SELECT COUNT(*) as cnt FROM nodes WHERE created_at >= datetime('now', '-1 day')"
+        ).fetchone()["cnt"]
+        layers = {}
+        for row in self._conn.execute(
+            "SELECT COALESCE(json_extract(properties, '$.layer'), 'unknown') as layer, COUNT(*) as cnt "
+            "FROM nodes WHERE status != 'deleted' GROUP BY layer"
+        ).fetchall():
+            layers[row["layer"]] = row["cnt"]
+        return {
+            "total_nodes": node_count,
+            "total_edges": edge_count,
+            "capture_24h": capture_24h,
+            "layers": layers,
+        }
+
+    def get_doctor(self) -> Dict[str, Any]:
+        """Enhanced health check returning stats + FAISS status."""
+        stats = self.get_stats()
+        faiss_status = "unknown"
+        try:
+            from magma.vector.faiss_index import get_faiss_index
+            idx = get_faiss_index(0)
+            if idx.is_available:
+                faiss_status = f"ok ({idx.count} vectors, dim={idx.dimension})"
+            else:
+                faiss_status = "not_built"
+        except Exception as e:
+            faiss_status = f"error: {e}"
+        return {
+            "status": "ok",
+            "service": "magma",
+            "version": "0.1.0",
+            "db_path": self.db_path,
+            "faiss": faiss_status,
+            "stats": stats,
+        }
 
     def close(self):
         if self._conn:

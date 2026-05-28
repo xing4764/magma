@@ -1,6 +1,7 @@
-"""Shared retrieval logic for MAGMA API and MCP entrypoints."""
+﻿"""Shared retrieval logic for MAGMA API and MCP entrypoints."""
 
 import json
+import logging
 import math
 import re
 from datetime import datetime
@@ -9,6 +10,8 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 
 from magma.entities import classify_memory_scope, extract_entities
+
+logger = logging.getLogger("magma.search")
 
 INTENT_KEYWORDS = {
     "temporal": (
@@ -133,14 +136,18 @@ def _node_searchable_text(node: Dict[str, Any]) -> str:
     return " ".join(parts).lower()
 
 
-def _keyword_score(query: str, node: Dict[str, Any]) -> float:
-    searchable = _node_searchable_text(node)
+def _keyword_score(query: str, node: Dict[str, Any], searchable_text: str = None, query_terms: List[str] = None) -> float:
+    if searchable_text is None:
+        searchable = _node_searchable_text(node)
+    else:
+        searchable = searchable_text
     query_lower = query.lower()
     score = 0.0
 
     if query_lower and query_lower in searchable:
         score += 0.35
-    for term in _query_terms(query):
+    terms = query_terms if query_terms is not None else _query_terms(query)
+    for term in terms:
         if term in searchable:
             score += min(0.08 + len(term) / 80.0, 0.18)
     if query_lower and query_lower in node.get("label", "").lower():
@@ -219,14 +226,23 @@ def _entity_overlap_multiplier(query_entities: List[Dict[str, str]], node: Dict[
 def _memory_quality_multiplier(node: Dict[str, Any]) -> float:
     props = node.get("properties", {}) or {}
     layer = props.get("layer")
+    kind = props.get("kind")
     source = props.get("source")
     label = node.get("label") or ""
-    if layer in {"L1", "summary", "decision", "fact", "current_state"}:
+    # L1 kind-specific weighting: current_state > decision > fact > L0
+    if layer == "L1":
+        kind_weights = {
+            "current_state": 1.30,
+            "decision": 1.25,
+            "fact": 1.18,
+        }
+        return kind_weights.get(kind, 1.20)
+    if layer in {"summary", "decision", "fact", "current_state"}:
         return 1.2
     if layer == "ops_anchor" or source == "magma_operational_anchor":
         return 1.08
     if layer == "entity_anchor" or label == "entity":
-        return 0.62
+        return 0.35
     if layer != "L0":
         return 1.03 if label == "topic" else 1.0
     role = props.get("role")
@@ -240,7 +256,7 @@ def _memory_quality_multiplier(node: Dict[str, Any]) -> float:
             multiplier *= 0.9
         if any(term in content for term in ("\u4e09\u4e2a\u95ee\u9898", "\u4ee5\u4e0b\u662f\u4e09\u4e2a", "\u9010\u9879\u56de\u7b54")):
             multiplier *= 0.92
-        return multiplier
+        return max(multiplier, 0.85)
     if role != "user":
         return 1.0
     question_terms = (
@@ -249,7 +265,7 @@ def _memory_quality_multiplier(node: Dict[str, Any]) -> float:
         "\u53ef\u4ee5\u95ee", "\u6d4b\u8bd5",
     )
     if any(term in content for term in question_terms):
-        return 0.62
+        return 0.85
     return 0.86
 
 
@@ -426,9 +442,30 @@ def _promote_operational_anchor(results: List[Dict[str, Any]], top_k: int, query
 class MemorySearcher:
     """Semantic + lexical retrieval with lifecycle-aware ranking."""
 
-    def __init__(self, store, encoder):
+    def __init__(self, store, encoder, faiss_index=None):
         self.store = store
         self.encoder = encoder
+        self.faiss_index = faiss_index
+
+    def _build_faiss_if_needed(self):
+        """Build FAISS index from store if not already built."""
+        if self.faiss_index is None:
+            return
+        if self.faiss_index.is_available:
+            return
+        try:
+            all_nodes = self.store.query_nodes_with_embeddings(limit=999999, include_archived=True)
+            entries = []
+            for node in all_nodes:
+                blob = node.pop("embedding", None)
+                if blob:
+                    vec = np.frombuffer(blob, dtype=np.float32)
+                    if vec.ndim == 1 and vec.shape[0] > 0:
+                        entries.append((node["id"], vec))
+            self.faiss_index.build_from_embeddings(entries)
+            logger.info(f"FAISS index auto-built with {len(entries)} vectors")
+        except Exception as e:
+            logger.warning(f"FAISS auto-build failed: {e}")
 
     def query(
         self,
@@ -439,7 +476,7 @@ class MemorySearcher:
         filters = filters or {}
         include_archived = bool(filters.get("include_archived", False))
         label = filters.get("label")
-        pool_size = int(filters.get("pool_size", max(top_k * 20, 1000)))
+        pool_size = int(filters.get("pool_size", 99999))
         property_filters = _property_filters(filters)
         intent = filters.get("intent") or detect_intent(query)
         include_related = bool(filters.get("include_related", False))
@@ -449,6 +486,9 @@ class MemorySearcher:
         query_entities = extract_entities(query)
         query_scope = classify_memory_scope(query_entities)
 
+        # --- Pre-compute shared query data once ---
+        query_lower = query.lower()
+        query_terms = _query_terms(query)
         query_embedding = None
         expected_dim = 0
         try:
@@ -456,22 +496,83 @@ class MemorySearcher:
             expected_dim = int(query_embedding.shape[0])
         except Exception:
             query_embedding = None
-        nodes = self.store.query_nodes_with_embeddings(
-            label=label,
-            limit=pool_size,
-            include_archived=include_archived,
-            property_filters=property_filters,
-        )
 
+        # --- Try FAISS first for semantic scores ---
+        faiss_semantic: Dict[str, float] = {}
+        faiss_used = False
+        if query_embedding is not None and self.faiss_index is not None:
+            self._build_faiss_if_needed()
+            if self.faiss_index.is_available and self.faiss_index.dimension == expected_dim:
+                try:
+                    # Get more candidates from FAISS to account for keyword-only matches
+                    faiss_top_k = min(max(top_k * 5, 50), self.faiss_index.count)
+                    if faiss_top_k > 0:
+                        faiss_results = self.faiss_index.search(query_embedding, faiss_top_k)
+                        for nid, score in faiss_results:
+                            faiss_semantic[nid] = max(score, 0.0)
+                        faiss_used = True
+                except Exception as e:
+                    logger.warning(f"FAISS search failed, falling back to brute force: {e}")
+                    faiss_semantic = {}
+
+        if faiss_used:
+            # FAISS provides semantic scores - use lighter query without BLOBs
+            nodes = self.store.query_nodes_properties_only(
+                label=label,
+                limit=pool_size,
+                include_archived=include_archived,
+                property_filters=property_filters,
+            )
+        else:
+            nodes = self.store.query_nodes_with_embeddings(
+                label=label,
+                limit=pool_size,
+                include_archived=include_archived,
+                property_filters=property_filters,
+            )
+
+        # --- Batch decode embeddings + batch cosine (fallback or complement) ---
+        semantic_scores: Dict[str, float] = {}
+        if faiss_used:
+            # FAISS provides all semantic scores; no BLOBs loaded
+            semantic_scores.update(faiss_semantic)
+        else:
+            # Brute-force fallback (original path)
+            if query_embedding is not None and nodes:
+                valid_embeddings = []
+                valid_ids = []
+                for node in nodes:
+                    blob = node.pop("embedding", None)
+                    if blob:
+                        vec = np.frombuffer(blob, dtype=np.float32)
+                        if vec.shape[0] == expected_dim:
+                            valid_embeddings.append(vec)
+                            valid_ids.append(node["id"])
+                            continue
+                    node.pop("embedding", None)
+                if valid_embeddings:
+                    emb_matrix = np.array(valid_embeddings, dtype=np.float32)
+                    norms = np.linalg.norm(emb_matrix, axis=1, keepdims=True)
+                    emb_normed = emb_matrix / np.maximum(norms, 1e-10)
+                    scores_raw = emb_normed @ query_embedding
+                    for nid, sc in zip(valid_ids, scores_raw):
+                        semantic_scores[nid] = max(float(sc), 0.0)
+
+        # --- Pre-compute searchable texts ---
+        searchable_texts = {}
+        for node in nodes:
+            searchable_texts[node["id"]] = _node_searchable_text(node)
+
+        # --- Score all nodes ---
         results = []
         for node in nodes:
-            semantic_score = 0.0
-            embedding = _embedding_from_blob(node.pop("embedding", None), expected_dim)
-            if query_embedding is not None and embedding is not None:
-                semantic_score = float(np.dot(query_embedding, embedding))
-                semantic_score = max(semantic_score, 0.0)
+            nid = node["id"]
+            semantic_score = semantic_scores.get(nid, 0.0)
+            searchable = searchable_texts.get(nid, "")
 
-            keyword_score = _keyword_score(query, node)
+            # Fast keyword score using pre-computed data
+            keyword_score = _keyword_score(query, node, searchable, query_terms)
+
             if semantic_score <= 0 and keyword_score <= 0:
                 continue
 
@@ -493,9 +594,26 @@ class MemorySearcher:
             if combined <= 0:
                 continue
 
+            # --- P1-A: anti-kill floor ---
+            base_score = semantic_score * 0.75 + keyword_score * 0.25
+            original_combined = combined
+            if base_score >= 0.5 and combined < base_score * 0.6:
+                combined = base_score * 0.6
+
             provenance = _provenance(node)
             memory_scope = _memory_scope(node)
             node["score"] = round(float(combined), 6)
+            node["score_breakdown"] = {
+                "base": round(base_score, 4),
+                "lifecycle": round(float(lifecycle), 4),
+                "agent_scope": round(float(agent_scope), 4),
+                "intent_scope": round(float(intent_scope), 4),
+                "entity_scope": round(float(entity_scope), 4),
+                "quality_scope": round(float(quality_scope), 4),
+                "authority_scope": round(float(authority_scope), 4),
+                "combined_before_floor": round(float(original_combined), 4),
+                "floor_applied": round(float(combined), 4) != round(float(original_combined), 4),
+            }
             node["semantic_score"] = round(float(semantic_score), 6)
             node["keyword_score"] = round(float(keyword_score), 6)
             node["lifecycle_multiplier"] = round(float(lifecycle), 6)

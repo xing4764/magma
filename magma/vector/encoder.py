@@ -2,13 +2,15 @@
 
 import os
 import numpy as np
+from pathlib import Path
 from typing import List, Union
 
 # Use the official Hub by default. Set HF_ENDPOINT explicitly when a mirror is needed.
 os.environ.setdefault("HF_ENDPOINT", "https://huggingface.co")
 
 _models = {}
-_MODEL_NAME = os.environ.get("MAGMA_EMBEDDING_MODEL", "BAAI/bge-small-zh-v1.5")
+_LOCAL_QWEN = str(Path(__file__).parent.parent.parent / "models" / "Qwen" / "Qwen3-Embedding-0___6B")
+_MODEL_NAME = os.environ.get("MAGMA_EMBEDDING_MODEL", _LOCAL_QWEN)
 
 
 def _get_model(model_name: str = _MODEL_NAME):

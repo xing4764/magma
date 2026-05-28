@@ -85,6 +85,41 @@ The realtime recall path must stay fast because it runs before prompt build:
 - Use `scripts/qwen_embedding_probe.py` and `scripts/qwen_reranker_probe.py` for offline A/B tests only.
 - Do not enable Qwen3 reranking in the realtime `before_prompt_build` path on CPU-only 12GB hosts; top20 reranking can take tens of seconds.
 
+## L1 Distillation Cron
+
+A Windows scheduled task `MAGMA-L1-Distill` runs `magma_l1_distill.py` every 65 minutes:
+
+```powershell
+# Verify task status
+Get-ScheduledTask -TaskName "MAGMA-L1-Distill"
+Get-ScheduledTaskInfo -TaskName "MAGMA-L1-Distill"
+
+# Manual trigger
+Start-ScheduledTask -TaskName "MAGMA-L1-Distill"
+
+# Run script directly (for debugging)
+python C:\openclaw-magma\scripts\magma_l1_distill.py --hours 4 --verbose
+```
+
+The script looks back 4 hours per run (overlapping windows are safe due to upsert logic).
+
+### L1 Recall Weighting
+
+L1 nodes receive higher recall weight than L0 in `magma/search.py`:
+
+| Layer / Kind | Quality Multiplier |
+|---|---|
+| L1 · current_state | 1.30 |
+| L1 · decision | 1.25 |
+| L1 · fact | 1.18 |
+| L1 · (unclassified) | 1.20 |
+| ops_anchor | 1.08 |
+| L0 · user (non-question) | 0.86 |
+| L0 · user (question) | 0.62 |
+| L0 · assistant | 0.98 |
+
+Combined with operational authority multiplier (up to 1.34x for keyword-matching L1 nodes), L1 current_state nodes can achieve up to ~1.74x total boost over L0 baseline.
+
 ## Escalation Rule
 
 Escalate to technical maintenance when:

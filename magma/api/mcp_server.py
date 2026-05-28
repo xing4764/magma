@@ -117,6 +117,79 @@ async def list_tools() -> List[Tool]:
                 "required": ["node_id"],
             },
         ),
+        Tool(
+            name="magma_feedback",
+            description="Report which recalled memories were useful after a query. Improves future recall ranking.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "event_id": {"type": "string", "description": "The recall event ID"},
+                    "recalled": {"type": "array", "items": {"type": "string"}, "description": "List of recalled node IDs"},
+                    "used": {"type": "array", "items": {"type": "string"}, "description": "List of node IDs that were actually useful"},
+                    "query": {"type": "string", "description": "Original query (optional)"},
+                },
+                "required": ["event_id", "recalled", "used"],
+            },
+        ),
+        Tool(
+            name="magma_delete_node",
+            description="Soft-delete a node by marking it as deleted (status=deleted). Does not remove from disk.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node_id": {"type": "string", "description": "The node ID to delete"},
+                },
+                "required": ["node_id"],
+            },
+        ),
+        Tool(
+            name="magma_update_node",
+            description="Partially update a node's properties. Only provided keys are overwritten.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node_id": {"type": "string", "description": "The node ID to update"},
+                    "properties": {"type": "object", "description": "Properties to merge/update", "additionalProperties": True},
+                },
+                "required": ["node_id", "properties"],
+            },
+        ),
+        Tool(
+            name="magma_consolidate",
+            description="Trigger manual cleanup: remove duplicate edges, orphan edges, expire stale nodes.",
+            inputSchema={
+                "type": "object",
+                "properties": {},
+            },
+        ),
+        Tool(
+            name="magma_doctor",
+            description="Enhanced health check: node/edge counts, FAISS status, recent capture stats.",
+            inputSchema={
+                "type": "object",
+                "properties": {},
+            },
+        ),
+        Tool(
+            name="magma_stats",
+            description="Return knowledge graph statistics: node count, edge count, 24h capture volume, layer distribution.",
+            inputSchema={
+                "type": "object",
+                "properties": {},
+            },
+        ),
+        Tool(
+            name="magma_search_by_entity",
+            description="Find nodes by exact entity name (no semantic search). Useful for precise lookups.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "entity_name": {"type": "string", "description": "Entity name to search for"},
+                    "entity_type": {"type": "string", "description": "Optional entity type filter"},
+                },
+                "required": ["entity_name"],
+            },
+        ),
     ]
 
 
@@ -133,6 +206,20 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> List[TextContent]:
             return await _handle_list_nodes(arguments)
         elif name == "magma_get_node":
             return await _handle_get_node(arguments)
+        elif name == "magma_feedback":
+            return await _handle_feedback(arguments)
+        elif name == "magma_delete_node":
+            return await _handle_delete_node(arguments)
+        elif name == "magma_update_node":
+            return await _handle_update_node(arguments)
+        elif name == "magma_consolidate":
+            return await _handle_consolidate(arguments)
+        elif name == "magma_doctor":
+            return await _handle_doctor(arguments)
+        elif name == "magma_stats":
+            return await _handle_stats(arguments)
+        elif name == "magma_search_by_entity":
+            return await _handle_search_by_entity(arguments)
         else:
             return [TextContent(type="text", text=f"Unknown tool: {name}")]
     except Exception as e:
@@ -197,6 +284,84 @@ async def _handle_get_node(args: Dict[str, Any]) -> List[TextContent]:
         if "404" in str(e):
             return [TextContent(type="text", text=f"Node '{args['node_id']}' not found.")]
         raise
+
+
+async def _handle_feedback(args: Dict[str, Any]) -> List[TextContent]:
+    """Proxy to POST /api/v1/feedback"""
+    result = _api_request("POST", "/api/v1/feedback", {
+        "event_id": args["event_id"],
+        "recalled": args.get("recalled", []),
+        "used": args.get("used", []),
+        "query": args.get("query", ""),
+    })
+    return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
+
+
+async def _handle_delete_node(args: Dict[str, Any]) -> List[TextContent]:
+    """Proxy to DELETE /api/v1/nodes/{node_id}"""
+    node_id = urllib.parse.quote(args["node_id"], safe="")
+    try:
+        result = _api_request("DELETE", f"/api/v1/nodes/{node_id}")
+        return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
+    except RuntimeError as e:
+        if "404" in str(e):
+            return [TextContent(type="text", text=f"Node '{args['node_id']}' not found.")]
+        raise
+
+
+async def _handle_update_node(args: Dict[str, Any]) -> List[TextContent]:
+    """Proxy to PATCH /api/v1/nodes/{node_id}"""
+    node_id = urllib.parse.quote(args["node_id"], safe="")
+    try:
+        result = _api_request("PATCH", f"/api/v1/nodes/{node_id}", args.get("properties", {}))
+        return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
+    except RuntimeError as e:
+        if "404" in str(e):
+            return [TextContent(type="text", text=f"Node '{args['node_id']}' not found.")]
+        raise
+
+
+async def _handle_consolidate(args: Dict[str, Any]) -> List[TextContent]:
+    """Proxy to POST /api/v1/consolidate"""
+    result = _api_request("POST", "/api/v1/consolidate")
+    return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
+
+
+async def _handle_doctor(args: Dict[str, Any]) -> List[TextContent]:
+    """Proxy to GET /api/v1/doctor"""
+    result = _api_request("GET", "/api/v1/doctor")
+    return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
+
+
+async def _handle_stats(args: Dict[str, Any]) -> List[TextContent]:
+    """Proxy to GET /api/v1/stats"""
+    result = _api_request("GET", "/api/v1/stats")
+    return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
+
+
+async def _handle_search_by_entity(args: Dict[str, Any]) -> List[TextContent]:
+    """Proxy to GET /api/v1/nodes?label=entity with name filter"""
+    entity_name = args["entity_name"]
+    entity_type = args.get("entity_type")
+    # Use query endpoint with filters for entity search
+    result = _api_request("POST", "/api/v1/query", {
+        "query": entity_name,
+        "top_k": 10,
+        "filters": {"label": "entity"},
+    })
+    results = result.get("results", result)
+    # Filter by exact name match in properties
+    if isinstance(results, list):
+        filtered = [
+            r for r in results
+            if (r.get("properties") or {}).get("name", "").lower() == entity_name.lower()
+        ]
+        if entity_type:
+            filtered = [r for r in filtered if (r.get("properties") or {}).get("entity_type") == entity_type]
+        results = filtered if filtered else results[:5]
+    if not results:
+        results = [{"info": f"No entity found for '{entity_name}'."}]
+    return [TextContent(type="text", text=json.dumps(results, ensure_ascii=False, indent=2))]
 
 
 async def main():
