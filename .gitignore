@@ -52,4 +52,4 @@ scripts/magma_l1_distill_llm.py
 start_server.bat
 
 # Non-core docs
-起源于.md
+# 起源.md (tracked, kept in repo)
