@@ -1,6 +1,6 @@
-"""MAGMA MCP Server - Thin proxy to 8904 HTTP API.
+"""MAGMA MCP Server - Thin proxy to 8902 HTTP API.
 
-All operations route through http://127.0.0.1:8904/api/v1/...
+All operations route through http://127.0.0.1:8902/api/v1/...
 This avoids cold-starting the embedding model in the MCP stdio process
 and ensures all queries pass through the FastAPI governance logic.
 """
@@ -21,7 +21,7 @@ from mcp.types import Tool, TextContent
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("magma.mcp")
 
-API_BASE = os.environ.get("MAGMA_API_BASE", "http://127.0.0.1:8904").rstrip("/")
+API_BASE = os.environ.get("MAGMA_API_BASE", "http://127.0.0.1:8902").rstrip("/")
 API_TIMEOUT = int(os.environ.get("MAGMA_API_TIMEOUT", "30"))
 
 

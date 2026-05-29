@@ -157,6 +157,32 @@ def extract_facts(text: str, role: str = "user", api_key: str = None) -> List[Di
 
     prompt = EXTRACTION_PROMPT.format(text=cleaned)
     llm_output = _call_llm(prompt, api_key=api_key)
+
+
+def extract_facts_batch(user_text: str, assistant_text: str, api_key: str = None) -> List[Dict[str, any]]:
+    """Extract atomic facts from both user and assistant text in a single LLM call.
+
+    Combines both texts into one prompt to reduce LLM calls from 2 to 1.
+    """
+    parts = []
+    for role, text in (("user", user_text), ("assistant", assistant_text)):
+        cleaned = (text or "").strip()
+        if len(cleaned) < 20:
+            continue
+        skip_patterns = (
+            "你好", "谢谢", "好的", "收到", "嗯", "ok", "OK", "hi", "hello",
+            "测试", "test", "请问", "可以问",
+        )
+        if cleaned in skip_patterns:
+            continue
+        parts.append(f"【{role}】{cleaned}")
+
+    if not parts:
+        return []
+
+    combined_text = "\n".join(parts)
+    prompt = EXTRACTION_PROMPT.format(text=combined_text)
+    llm_output = _call_llm(prompt, api_key=api_key)
     facts = _parse_facts(llm_output)
 
     # Post-filter: deduplicate and limit

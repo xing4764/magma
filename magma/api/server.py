@@ -262,7 +262,8 @@ def create_app() -> FastAPI:
         store = getattr(app.state, "store", None) or get_store()
         encoder = getattr(app.state, "encoder", None) or Encoder()
         faiss_index = getattr(app.state, "faiss_index", None)
-        results = MemorySearcher(store, encoder, faiss_index).query(req.query, req.top_k, req.filters)
+        searcher = MemorySearcher(store, encoder, faiss_index)
+        results = await asyncio.to_thread(searcher.query, req.query, req.top_k, req.filters)
         if not results:
             results = [{
                 "id": "system",
@@ -282,17 +283,18 @@ def create_app() -> FastAPI:
         encoder = getattr(app.state, "encoder", None) or Encoder()
         properties = dict(req.properties or {})
         text_for_embedding = _node_text(req.label, properties)
-        properties.update(_memory_metadata(text_for_embedding))
-        embedding = encoder.encode(text_for_embedding).astype("float32")
+        properties.update(await asyncio.to_thread(_memory_metadata, text_for_embedding))
+        embedding = await asyncio.to_thread(encoder.encode, text_for_embedding)
+        embedding = embedding.astype("float32")
 
-        store.add_node(req.id, req.label, properties, embedding)
-        _attach_entity_anchors(store, encoder, req.id, text_for_embedding, properties.get("source", "api"))
+        await asyncio.to_thread(store.add_node, req.id, req.label, properties, embedding)
+        await asyncio.to_thread(_attach_entity_anchors, store, encoder, req.id, text_for_embedding, properties.get("source", "api"))
 
         # Incrementally update FAISS index
         faiss_index = getattr(app.state, "faiss_index", None)
         if faiss_index and embedding is not None:
             try:
-                faiss_index.add(req.id, embedding)
+                await asyncio.to_thread(faiss_index.add, req.id, embedding)
             except Exception as e:
                 logger.warning(f"FAISS incremental add failed: {e}")
 
@@ -334,100 +336,100 @@ def create_app() -> FastAPI:
                 "source_agent_id": _parse_source_agent(req.session_key) or req.agent_id,
                 "department": DEPT_MAP.get(_parse_source_agent(req.session_key) or req.agent_id or "", ""),
             }
-            properties.update(_memory_metadata(cleaned))
+            properties.update(await asyncio.to_thread(_memory_metadata, cleaned))
             text_for_embedding = f"{role}: {cleaned}"
-            embedding = encoder.encode(text_for_embedding).astype("float32")
-            store.add_node(node_id, "event", properties, embedding)
-            _attach_entity_anchors(store, encoder, node_id, cleaned, req.source)
+            embedding = await asyncio.to_thread(encoder.encode, text_for_embedding)
+            embedding = embedding.astype("float32")
+            await asyncio.to_thread(store.add_node, node_id, "event", properties, embedding)
+            await asyncio.to_thread(_attach_entity_anchors, store, encoder, node_id, cleaned, req.source)
 
             # Incrementally update FAISS index
             faiss_index = getattr(app.state, "faiss_index", None)
             if faiss_index and embedding is not None:
                 try:
-                    faiss_index.add(node_id, embedding)
+                    await asyncio.to_thread(faiss_index.add, node_id, embedding)
                 except Exception as e:
                     logger.warning(f"FAISS incremental add failed: {e}")
 
             written.append(node_id)
 
         if len(written) == 2:
-            store.add_edge(written[0], written[1], "responded_by", {
+            await asyncio.to_thread(store.add_edge, written[0], written[1], "responded_by", {
                 "source": req.source,
                 "session_key": req.session_key,
             })
 
-        # --- P0-1: Fact Extraction + Temporal Reasoning ---
+        # --- P0-1: Fact Extraction (background, non-blocking) ---
+        # Run fact extraction as background task so capture returns immediately
         extract_facts_fn, is_available_fn = _get_fact_extractor()
-        if is_available_fn():
-            for role, text in (("user", req.user_text), ("assistant", req.assistant_text)):
-                cleaned = (text or "").strip()
-                if len(cleaned) < 8:
-                    continue
-                try:
-                    facts = extract_facts_fn(cleaned, role=role)
-                    for fact_item in facts:
-                        fact_text = fact_item["fact"]
-                        category = fact_item.get("category", "fact")
-                        entities = fact_item.get("entities", [])
-
-                        fact_digest = hashlib.sha1(
-                            f"{req.source}:{category}:{fact_text}".encode("utf-8")
-                        ).hexdigest()[:16]
-                        fact_node_id = f"fact:{category}:{fact_digest}"
-
-                        fact_properties = {
-                            "layer": "L0",
-                            "source": req.source,
-                            "role": "fact",
-                            "content": fact_text,
-                            "fact_category": category,
-                            "fact_entities": json.dumps(entities, ensure_ascii=False),
-                            "agent_id": req.agent_id,
-                            "session_key": req.session_key,
-                            "session_id": req.session_id,
-                            "ttl_days": 365,  # Facts live longer than raw captures
-                            "importance": 0.65,
-                            "source_agent_id": _parse_source_agent(req.session_key) or req.agent_id,
-                            "department": DEPT_MAP.get(_parse_source_agent(req.session_key) or req.agent_id or "", ""),
-                        }
-                        fact_properties.update(_memory_metadata(fact_text))
-
-                        fact_embedding = encoder.encode(fact_text).astype("float32")
-                        store.add_node(fact_node_id, "fact", fact_properties, fact_embedding)
-
-                        # Link fact to source event nodes
-                        for evt_id in written:
-                            store.add_edge_once(evt_id, fact_node_id, "extracted_fact", {
-                                "source": req.source,
-                                "category": category,
-                            })
-
-                        # Temporal reasoning: invalidate old facts about same entity+category
-                        for entity_name in entities:
-                            try:
-                                store.invalidate_old_facts(
-                                    entity_name=entity_name,
-                                    category=category,
-                                    exclude_node_id=fact_node_id,
-                                )
-                            except Exception as e:
-                                logger.warning(f"Temporal invalidation failed for {entity_name}: {e}")
-
-                        # Link fact to entity anchors
-                        _attach_entity_anchors(store, encoder, fact_node_id, fact_text, req.source)
-
-                        # Incrementally update FAISS
-                        if faiss_index and fact_embedding is not None:
-                            try:
-                                faiss_index.add(fact_node_id, fact_embedding)
-                            except Exception as e:
-                                logger.warning(f"FAISS incremental add for fact failed: {e}")
-
-                        written.append(fact_node_id)
-                except Exception as e:
-                    logger.warning(f"Fact extraction failed (non-fatal): {e}")
+        if is_available_fn() and written:
+            asyncio.create_task(_extract_facts_background(
+                req, written, encoder, store, faiss_index, extract_facts_fn
+            ))
 
         return {"status": "ok", "written": written, "count": len(written)}
+
+    async def _extract_facts_background(req, written, encoder, store, faiss_index, extract_facts_fn):
+        """Background task: extract facts without blocking capture response."""
+        try:
+            from magma.fact_extractor import extract_facts_batch
+            facts = await asyncio.to_thread(extract_facts_batch, req.user_text, req.assistant_text)
+            for fact_item in facts:
+                fact_text = fact_item["fact"]
+                category = fact_item.get("category", "fact")
+                entities = fact_item.get("entities", [])
+
+                fact_digest = hashlib.sha1(
+                    f"{req.source}:{category}:{fact_text}".encode("utf-8")
+                ).hexdigest()[:16]
+                fact_node_id = f"fact:{category}:{fact_digest}"
+
+                fact_properties = {
+                    "layer": "L0",
+                    "source": req.source,
+                    "role": "fact",
+                    "content": fact_text,
+                    "fact_category": category,
+                    "fact_entities": json.dumps(entities, ensure_ascii=False),
+                    "agent_id": req.agent_id,
+                    "session_key": req.session_key,
+                    "session_id": req.session_id,
+                    "ttl_days": 365,
+                    "importance": 0.65,
+                    "source_agent_id": _parse_source_agent(req.session_key) or req.agent_id,
+                    "department": DEPT_MAP.get(_parse_source_agent(req.session_key) or req.agent_id or "", ""),
+                }
+                fact_properties.update(await asyncio.to_thread(_memory_metadata, fact_text))
+
+                fact_embedding = await asyncio.to_thread(encoder.encode, fact_text)
+                fact_embedding = fact_embedding.astype("float32")
+                await asyncio.to_thread(store.add_node, fact_node_id, "fact", fact_properties, fact_embedding)
+
+                for evt_id in written:
+                    await asyncio.to_thread(store.add_edge_once, evt_id, fact_node_id, "extracted_fact", {
+                        "source": req.source,
+                        "category": category,
+                    })
+
+                for entity_name in entities:
+                    try:
+                        await asyncio.to_thread(store.invalidate_old_facts,
+                            entity_name=entity_name,
+                            category=category,
+                            exclude_node_id=fact_node_id,
+                        )
+                    except Exception as e:
+                        logger.warning(f"Temporal invalidation failed for {entity_name}: {e}")
+
+                await asyncio.to_thread(_attach_entity_anchors, store, encoder, fact_node_id, fact_text, req.source)
+
+                if faiss_index and fact_embedding is not None:
+                    try:
+                        await asyncio.to_thread(faiss_index.add, fact_node_id, fact_embedding)
+                    except Exception as e:
+                        logger.warning(f"FAISS incremental add for fact failed: {e}")
+        except Exception as e:
+            logger.warning(f"Background fact extraction failed (non-fatal): {e}")
 
     @app.post("/api/v1/edges")
     async def add_edge(req: EdgeRequest):
@@ -478,11 +480,12 @@ def create_app() -> FastAPI:
                 label = existing_node.get("label", "")
                 text_for_embedding = _node_text(label, merged_props)
                 try:
-                    new_embedding = encoder.encode(text_for_embedding).astype("float32")
+                    new_embedding = await asyncio.to_thread(encoder.encode, text_for_embedding)
+                    new_embedding = new_embedding.astype("float32")
                 except Exception as e:
                     logger.warning(f"Failed to re-encode embedding for {node_id}: {e}")
 
-        if not store.update_node(node_id, properties, embedding=new_embedding):
+        if not await asyncio.to_thread(store.update_node, node_id, properties, embedding=new_embedding):
             raise HTTPException(status_code=404, detail=f"Node {node_id} not found")
 
         # Update FAISS index with new embedding
@@ -491,8 +494,8 @@ def create_app() -> FastAPI:
             if faiss_index:
                 try:
                     # Remove old entry and add new one
-                    faiss_index.remove(node_id)
-                    faiss_index.add(node_id, new_embedding)
+                    await asyncio.to_thread(faiss_index.remove, node_id)
+                    await asyncio.to_thread(faiss_index.add, node_id, new_embedding)
                 except Exception as e:
                     logger.warning(f"FAISS update failed for {node_id}: {e}")
 
