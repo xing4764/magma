@@ -1,6 +1,6 @@
-"""MAGMA MCP Server - Thin proxy to 8902 HTTP API.
+"""MAGMA MCP Server - Thin proxy to 8904 HTTP API.
 
-All operations route through http://127.0.0.1:8902/api/v1/...
+All operations route through http://127.0.0.1:8904/api/v1/...
 This avoids cold-starting the embedding model in the MCP stdio process
 and ensures all queries pass through the FastAPI governance logic.
 """
@@ -21,7 +21,7 @@ from mcp.types import Tool, TextContent
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("magma.mcp")
 
-API_BASE = os.environ.get("MAGMA_API_BASE", "http://127.0.0.1:8902").rstrip("/")
+API_BASE = os.environ.get("MAGMA_API_BASE", "http://127.0.0.1:8904").rstrip("/")
 API_TIMEOUT = int(os.environ.get("MAGMA_API_TIMEOUT", "30"))
 
 
@@ -50,6 +50,11 @@ app = Server("magma-memory")
 
 @app.list_tools()
 async def list_tools() -> List[Tool]:
+    # Core tools (P0): query, add_node, add_edge, list_nodes, get_node,
+    #                   feedback, delete_node, update_node, consolidate,
+    #                   doctor, stats, search_by_entity
+    # Extension tools (P0-3): memory_edit, memory_forget, core_memory_get/set, timeline
+    # Extension tools (P1): entity_add, entity_remove, entity_list
     return [
         Tool(
             name="magma_query",
@@ -449,29 +454,15 @@ async def _handle_stats(args: Dict[str, Any]) -> List[TextContent]:
 
 
 async def _handle_search_by_entity(args: Dict[str, Any]) -> List[TextContent]:
-    """Proxy to GET /api/v1/nodes?label=entity with name filter"""
-    entity_name = args["entity_name"]
-    entity_type = args.get("entity_type")
-    # Use query endpoint with filters for entity search
-    result = _api_request("POST", "/api/v1/query", {
-        "query": entity_name,
-        "top_k": 10,
-        "filters": {"label": "entity"},
+    """Proxy to POST /api/v1/search_by_entity (precise entity lookup)."""
+    result = _api_request("POST", "/api/v1/search_by_entity", {
+        "entity_name": args["entity_name"],
+        "entity_type": args.get("entity_type"),
     })
     results = result.get("results", result)
-    # Filter by exact name match in properties
-    if isinstance(results, list):
-        filtered = [
-            r for r in results
-            if (r.get("properties") or {}).get("name", "").lower() == entity_name.lower()
-        ]
-        if entity_type:
-            filtered = [r for r in filtered if (r.get("properties") or {}).get("entity_type") == entity_type]
-        results = filtered if filtered else results[:5]
     if not results:
-        results = [{"info": f"No entity found for '{entity_name}'."}]
+        results = [{"info": f"No entity found for '{args['entity_name']}'."}]
     return [TextContent(type="text", text=json.dumps(results, ensure_ascii=False, indent=2))]
-
 
 async def _handle_memory_edit(args: Dict[str, Any]) -> List[TextContent]:
     """Proxy to PATCH /api/v1/nodes/{node_id} with content update + re-embedding."""
