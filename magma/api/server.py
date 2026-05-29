@@ -2,6 +2,7 @@
 
 import asyncio
 import hashlib
+import json
 import logging
 import os
 import sys
@@ -18,6 +19,21 @@ from pydantic import BaseModel
 os.environ.setdefault("HF_ENDPOINT", "https://huggingface.co")
 
 logger = logging.getLogger("magma.api")
+
+
+# Lazy-import fact extractor to avoid cold-start on import
+_fact_extractor = None
+
+
+def _get_fact_extractor():
+    global _fact_extractor
+    if _fact_extractor is None:
+        try:
+            from magma.fact_extractor import extract_facts, is_fact_extraction_available
+            _fact_extractor = (extract_facts, is_fact_extraction_available)
+        except Exception:
+            _fact_extractor = (lambda t, r=None, **kw: [], lambda: False)
+    return _fact_extractor
 
 
 DEPT_MAP = {
@@ -138,8 +154,8 @@ class FeedbackRequest(BaseModel):
     session_key: Optional[str] = None
     recalled: list = []
     used: list = []
-    positive_delta: float = 0.025
-    unused_delta: float = -0.004
+    positive_delta: float = 0.05
+    unused_delta: float = -0.01
 
 
 def create_app() -> FastAPI:
@@ -340,6 +356,77 @@ def create_app() -> FastAPI:
                 "session_key": req.session_key,
             })
 
+        # --- P0-1: Fact Extraction + Temporal Reasoning ---
+        extract_facts_fn, is_available_fn = _get_fact_extractor()
+        if is_available_fn():
+            for role, text in (("user", req.user_text), ("assistant", req.assistant_text)):
+                cleaned = (text or "").strip()
+                if len(cleaned) < 8:
+                    continue
+                try:
+                    facts = extract_facts_fn(cleaned, role=role)
+                    for fact_item in facts:
+                        fact_text = fact_item["fact"]
+                        category = fact_item.get("category", "fact")
+                        entities = fact_item.get("entities", [])
+
+                        fact_digest = hashlib.sha1(
+                            f"{req.source}:{category}:{fact_text}".encode("utf-8")
+                        ).hexdigest()[:16]
+                        fact_node_id = f"fact:{category}:{fact_digest}"
+
+                        fact_properties = {
+                            "layer": "L0",
+                            "source": req.source,
+                            "role": "fact",
+                            "content": fact_text,
+                            "fact_category": category,
+                            "fact_entities": json.dumps(entities, ensure_ascii=False),
+                            "agent_id": req.agent_id,
+                            "session_key": req.session_key,
+                            "session_id": req.session_id,
+                            "ttl_days": 365,  # Facts live longer than raw captures
+                            "importance": 0.65,
+                            "source_agent_id": _parse_source_agent(req.session_key) or req.agent_id,
+                            "department": DEPT_MAP.get(_parse_source_agent(req.session_key) or req.agent_id or "", ""),
+                        }
+                        fact_properties.update(_memory_metadata(fact_text))
+
+                        fact_embedding = encoder.encode(fact_text).astype("float32")
+                        store.add_node(fact_node_id, "fact", fact_properties, fact_embedding)
+
+                        # Link fact to source event nodes
+                        for evt_id in written:
+                            store.add_edge_once(evt_id, fact_node_id, "extracted_fact", {
+                                "source": req.source,
+                                "category": category,
+                            })
+
+                        # Temporal reasoning: invalidate old facts about same entity+category
+                        for entity_name in entities:
+                            try:
+                                store.invalidate_old_facts(
+                                    entity_name=entity_name,
+                                    category=category,
+                                    exclude_node_id=fact_node_id,
+                                )
+                            except Exception as e:
+                                logger.warning(f"Temporal invalidation failed for {entity_name}: {e}")
+
+                        # Link fact to entity anchors
+                        _attach_entity_anchors(store, encoder, fact_node_id, fact_text, req.source)
+
+                        # Incrementally update FAISS
+                        if faiss_index and fact_embedding is not None:
+                            try:
+                                faiss_index.add(fact_node_id, fact_embedding)
+                            except Exception as e:
+                                logger.warning(f"FAISS incremental add for fact failed: {e}")
+
+                        written.append(fact_node_id)
+                except Exception as e:
+                    logger.warning(f"Fact extraction failed (non-fatal): {e}")
+
         return {"status": "ok", "written": written, "count": len(written)}
 
     @app.post("/api/v1/edges")
@@ -372,12 +459,43 @@ def create_app() -> FastAPI:
     @app.patch("/api/v1/nodes/{node_id}")
     async def update_node(node_id: str, body: dict):
         from magma.graph.sqlite_store import get_store
+        from magma.vector.encoder import Encoder
 
         store = getattr(app.state, "store", None) or get_store()
+        encoder = getattr(app.state, "encoder", None) or Encoder()
         # Accept both {"properties": {...}} and flat {...}
         properties = body.get("properties", body)
-        if not store.update_node(node_id, properties):
+
+        # Check if content-affecting fields changed -> re-encode embedding
+        new_embedding = None
+        content_keys = {"content", "name", "title", "summary", "message"}
+        if content_keys & set(properties.keys()):
+            # Fetch existing node to get full context for embedding
+            existing_node = store.get_node(node_id)
+            if existing_node:
+                merged_props = dict(existing_node.get("properties", {}) or {})
+                merged_props.update(properties)
+                label = existing_node.get("label", "")
+                text_for_embedding = _node_text(label, merged_props)
+                try:
+                    new_embedding = encoder.encode(text_for_embedding).astype("float32")
+                except Exception as e:
+                    logger.warning(f"Failed to re-encode embedding for {node_id}: {e}")
+
+        if not store.update_node(node_id, properties, embedding=new_embedding):
             raise HTTPException(status_code=404, detail=f"Node {node_id} not found")
+
+        # Update FAISS index with new embedding
+        if new_embedding is not None:
+            faiss_index = getattr(app.state, "faiss_index", None)
+            if faiss_index:
+                try:
+                    # Remove old entry and add new one
+                    faiss_index.remove(node_id)
+                    faiss_index.add(node_id, new_embedding)
+                except Exception as e:
+                    logger.warning(f"FAISS update failed for {node_id}: {e}")
+
         return {"status": "ok", "id": node_id}
 
     @app.delete("/api/v1/nodes/{node_id}")
@@ -414,16 +532,52 @@ def create_app() -> FastAPI:
         from magma.graph.sqlite_store import get_store
 
         store = getattr(app.state, "store", None) or get_store()
-        nodes = store.query_nodes(label="entity", limit=100)
-        results = []
-        name_lower = req.entity_name.lower()
-        for node in nodes:
-            props = node.get("properties", {}) or {}
-            if props.get("name", "").lower() == name_lower:
-                if req.entity_type and props.get("entity_type") != req.entity_type:
-                    continue
-                results.append(node)
+        results = store.search_by_entity(
+            entity_name=req.entity_name,
+            entity_type=req.entity_type,
+        )
         return {"results": results, "count": len(results)}
+
+    @app.get("/api/v1/timeline/{entity_name}")
+    async def timeline(entity_name: str, limit: int = 20):
+        from magma.graph.sqlite_store import get_store
+
+        store = getattr(app.state, "store", None) or get_store()
+        results = store.get_fact_timeline(entity_name=entity_name, limit=limit)
+        return {"entity": entity_name, "facts": results, "count": len(results)}
+
+    @app.get("/api/v1/facts")
+    async def list_facts(entity_name: str = None, category: str = None, limit: int = 20):
+        from magma.graph.sqlite_store import get_store
+
+        store = getattr(app.state, "store", None) or get_store()
+        results = store.get_active_facts(entity_name=entity_name, category=category, limit=limit)
+        return {"facts": results, "count": len(results)}
+
+    # --- P1-1: Entity management endpoints ---
+    @app.get("/api/v1/entities")
+    async def list_entities():
+        from magma.entities import list_entities
+        entities = list_entities()
+        return {"entities": entities, "count": len(entities)}
+
+    @app.post("/api/v1/entities")
+    async def add_entity(body: dict):
+        from magma.entities import add_custom_entity
+        name = body.get("name")
+        entity_type = body.get("entity_type", "custom")
+        if not name:
+            raise HTTPException(status_code=400, detail="name is required")
+        added = add_custom_entity(name, entity_type)
+        return {"status": "ok" if added else "already_exists", "name": name, "entity_type": entity_type}
+
+    @app.delete("/api/v1/entities/{name}")
+    async def delete_entity(name: str):
+        from magma.entities import remove_custom_entity
+        removed = remove_custom_entity(name)
+        if not removed:
+            raise HTTPException(status_code=404, detail=f"Entity '{name}' not found")
+        return {"status": "ok", "name": name}
 
     @app.post("/api/v1/feedback")
     async def feedback(req: FeedbackRequest):

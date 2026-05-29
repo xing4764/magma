@@ -26,6 +26,9 @@ build/
 .venv/
 venv/
 
+# User-specific config
+config/custom_entities.json
+
 # IDE
 .vscode/
 .idea/
@@ -44,12 +47,17 @@ scripts/full_audit.py
 scripts/latency_test.py
 scripts/magma_l1_distill.py
 scripts/magma_l1_distill_llm.py
+scripts/github_stars.py
 
 # Backup files
 *.pre-fix
 
 # Local startup scripts
 start_server.bat
+scripts/start_magma_api.bat
+scripts/stop_magma_api.bat
+scripts/check_magma_api.bat
+scripts/get_api_key.py
 
 # Non-core docs
 # 起源.md (tracked, kept in repo)

@@ -2,10 +2,13 @@
 
 import sqlite3
 import json
+import logging
 import os
 import threading
 from pathlib import Path
 from typing import Optional, Dict, Any, List
+
+logger = logging.getLogger("magma.graph.sqlite_store")
 
 DB_PATH = os.environ.get("MAGMA_DB_PATH", str(Path(__file__).parent.parent.parent / "data" / "magma.db"))
 
@@ -81,6 +84,7 @@ class SQLiteStore:
         self._conn.execute("CREATE INDEX IF NOT EXISTS idx_nodes_status ON nodes(status)")
         self._conn.execute("CREATE INDEX IF NOT EXISTS idx_recall_events_session ON recall_events(session_key)")
         self._conn.execute("CREATE INDEX IF NOT EXISTS idx_recall_feedback_node ON recall_feedback(node_id)")
+        self._conn.execute("CREATE INDEX IF NOT EXISTS idx_nodes_label_status ON nodes(label, status)")
         self._conn.commit()
         return self
 
@@ -169,8 +173,15 @@ class SQLiteStore:
             )
             self._conn.commit()
 
-    def update_node(self, node_id: str, properties: Dict[str, Any]) -> bool:
-        """Partial update of node properties. Returns True if node existed."""
+    def update_node(self, node_id: str, properties: Dict[str, Any], embedding=None) -> bool:
+        """Partial update of node properties. Returns True if node existed.
+
+        Args:
+            node_id: Node ID to update.
+            properties: Properties to merge/update.
+            embedding: Optional new embedding (numpy array or bytes). If provided,
+                       updates the embedding column.
+        """
         cur = self._conn.execute("SELECT properties FROM nodes WHERE id = ?", (node_id,))
         row = cur.fetchone()
         if not row:
@@ -185,24 +196,45 @@ class SQLiteStore:
         status = existing.get("status", "active")
         source_agent_id = existing.get("source_agent_id")
         department = existing.get("department")
+        emb = embedding.tobytes() if hasattr(embedding, 'tobytes') else embedding
         with self._write_lock:
-            self._conn.execute(
-                """
-                UPDATE nodes
-                   SET properties = ?,
-                       importance = ?,
-                       ttl_days = ?,
-                       valid_from = ?,
-                       valid_until = ?,
-                       status = ?,
-                       source_agent_id = ?,
-                       department = ?,
-                       updated_at = CURRENT_TIMESTAMP
-                 WHERE id = ?
-                """,
-                (props_json, importance, ttl_days, valid_from, valid_until,
-                 status, source_agent_id, department, node_id)
-            )
+            if emb is not None:
+                self._conn.execute(
+                    """
+                    UPDATE nodes
+                       SET properties = ?,
+                           embedding = ?,
+                           importance = ?,
+                           ttl_days = ?,
+                           valid_from = ?,
+                           valid_until = ?,
+                           status = ?,
+                           source_agent_id = ?,
+                           department = ?,
+                           updated_at = CURRENT_TIMESTAMP
+                     WHERE id = ?
+                    """,
+                    (props_json, emb, importance, ttl_days, valid_from, valid_until,
+                     status, source_agent_id, department, node_id)
+                )
+            else:
+                self._conn.execute(
+                    """
+                    UPDATE nodes
+                       SET properties = ?,
+                           importance = ?,
+                           ttl_days = ?,
+                           valid_from = ?,
+                           valid_until = ?,
+                           status = ?,
+                           source_agent_id = ?,
+                           department = ?,
+                           updated_at = CURRENT_TIMESTAMP
+                     WHERE id = ?
+                    """,
+                    (props_json, importance, ttl_days, valid_from, valid_until,
+                     status, source_agent_id, department, node_id)
+                )
             self._conn.commit()
         return True
 
@@ -456,7 +488,32 @@ class SQLiteStore:
             "updates": updates,
         }
 
-    def consolidate(self) -> Dict[str, int]:
+    def consolidate(self, semantic_dedup: bool = True) -> Dict[str, int]:
+        """Run all consolidation steps including optional semantic dedup.
+        
+        Args:
+            semantic_dedup: If True, also run FAISS-based semantic duplicate detection.
+        """
+        v2_stats = {}
+        if semantic_dedup:
+            try:
+                from scripts.magma_consolidate_v2 import ConsolidationEngine
+                engine = ConsolidationEngine(
+                    db_path=self.db_path,
+                    semantic_threshold=0.90,
+                    entity_threshold=0.50,
+                )
+                result = engine.apply_merges(dry_run=False)
+                engine.close()
+                v2_stats = {
+                    "v2_semantic_merges": result.get("merged", 0),
+                    "v2_same_as_edges": result.get("same_as_edges_added", 0),
+                    "v2_errors": len(result.get("errors", [])),
+                }
+            except Exception as e:
+                logger.warning(f"Semantic dedup failed (non-fatal): {e}")
+                v2_stats = {"v2_semantic_merges": 0, "v2_error": str(e)}
+
         with self._write_lock:
             cur = self._conn.execute("""
                 DELETE FROM edges WHERE id NOT IN (
@@ -489,6 +546,20 @@ class SQLiteStore:
                    AND datetime(created_at, '+90 days') < CURRENT_TIMESTAMP
             """)
             low_importance_nodes = cur.rowcount
+
+            # P0-4: Auto-decay importance for long-unused memories
+            # Memories not accessed in 30+ days get importance *= 0.95
+            cur = self._conn.execute("""
+                UPDATE nodes
+                   SET importance = MAX(importance * 0.95, 0.05),
+                       properties = json_set(properties, '$.importance', MAX(importance * 0.95, 0.05)),
+                       updated_at = CURRENT_TIMESTAMP
+                 WHERE status = 'active'
+                   AND last_accessed_at IS NOT NULL
+                   AND datetime(last_accessed_at, '+30 days') < CURRENT_TIMESTAMP
+                   AND importance > 0.1
+            """)
+            decayed_nodes = cur.rowcount
 
             cur = self._conn.execute("""
                 SELECT properties, COUNT(*) as cnt, GROUP_CONCAT(id) as ids
@@ -537,13 +608,20 @@ class SQLiteStore:
                     merged_l0 += 1
 
             self._conn.commit()
+
+        # Physically purge soft-deleted nodes
+        purged = self.purge_deleted()
+
         return {
             "removed_duplicate_edges": removed_edges,
             "removed_orphan_edges": orphan_edges,
             "expired_nodes": expired_nodes,
             "low_importance_nodes": low_importance_nodes,
+            "decayed_nodes": decayed_nodes,
             "merged_duplicate_entities": merged,
             "merged_duplicate_l0": merged_l0,
+            "purged_deleted_nodes": purged,
+            **v2_stats,
         }
 
     def _add_same_as_edge(self, source_id: str, target_id: str, properties: Dict[str, Any]):
@@ -580,6 +658,53 @@ class SQLiteStore:
             "source_agent_id": row["source_agent_id"],
             "department": row["department"],
         }
+
+    def get_neighbor_ids(self, node_ids: List[str]) -> List[str]:
+        """Get all neighbor node IDs for a set of source nodes (graph walk helper)."""
+        if not node_ids:
+            return []
+        placeholders = ", ".join("?" for _ in node_ids)
+        cur = self._conn.execute(
+            f"""
+            SELECT source_id, target_id FROM edges
+             WHERE source_id IN ({placeholders}) OR target_id IN ({placeholders})
+            """,
+            node_ids + node_ids
+        )
+        node_set = set(node_ids)
+        neighbors = set()
+        for row in cur.fetchall():
+            src, tgt = row[0], row[1]
+            neighbor = tgt if src in node_set else src
+            if neighbor:
+                neighbors.add(neighbor)
+        return list(neighbors)
+
+    def get_neighbor_ids_with_relations(self, node_ids: List[str]) -> List[Dict[str, str]]:
+        """Get neighbor node IDs with relation types for weighted graph walk.
+
+        Returns list of {"id": neighbor_id, "relation": relation_type}.
+        """
+        if not node_ids:
+            return []
+        placeholders = ", ".join("?" for _ in node_ids)
+        cur = self._conn.execute(
+            f"""
+            SELECT source_id, target_id, relation FROM edges
+             WHERE source_id IN ({placeholders}) OR target_id IN ({placeholders})
+            """,
+            node_ids + node_ids
+        )
+        node_set = set(node_ids)
+        neighbors = {}
+        for row in cur.fetchall():
+            src, tgt, rel = row[0], row[1], row[2]
+            neighbor = tgt if src in node_set else src
+            if neighbor:
+                # Keep best relation weight per neighbor
+                if neighbor not in neighbors:
+                    neighbors[neighbor] = {"id": neighbor, "relation": rel}
+        return list(neighbors.values())
 
     def get_edges(self, node_id: str) -> List[Dict]:
         cur = self._conn.execute(
@@ -724,6 +849,178 @@ class SQLiteStore:
             "faiss": faiss_status,
             "stats": stats,
         }
+
+    def search_by_entity(self, entity_name: str, entity_type: str = None, limit: int = 20) -> List[Dict]:
+        """Search entity nodes by name using json_extract (indexed, avoids O(n) scan)."""
+        name_lower = entity_name.lower()
+        if entity_type:
+            cur = self._conn.execute(
+                """
+                SELECT id, label, properties, created_at, updated_at, last_accessed_at,
+                       access_count, importance, ttl_days, valid_from, valid_until, status,
+                       source_agent_id, department
+                FROM nodes
+                WHERE label = 'entity'
+                  AND status != 'deleted'
+                  AND LOWER(json_extract(properties, '$.name')) = ?
+                  AND json_extract(properties, '$.entity_type') = ?
+                LIMIT ?
+                """,
+                (name_lower, entity_type, limit)
+            )
+        else:
+            cur = self._conn.execute(
+                """
+                SELECT id, label, properties, created_at, updated_at, last_accessed_at,
+                       access_count, importance, ttl_days, valid_from, valid_until, status,
+                       source_agent_id, department
+                FROM nodes
+                WHERE label = 'entity'
+                  AND status != 'deleted'
+                  AND LOWER(json_extract(properties, '$.name')) = ?
+                LIMIT ?
+                """,
+                (name_lower, limit)
+            )
+        return [self._row_to_node(r) for r in cur.fetchall()]
+
+    def purge_deleted(self) -> int:
+        """Physically remove nodes with status='deleted' and their edges.
+        Returns the number of nodes purged."""
+        with self._write_lock:
+            # First remove edges referencing deleted nodes
+            self._conn.execute("""
+                DELETE FROM edges WHERE source_id IN (
+                    SELECT id FROM nodes WHERE status = 'deleted'
+                ) OR target_id IN (
+                    SELECT id FROM nodes WHERE status = 'deleted'
+                )
+            """)
+            # Then remove the deleted nodes themselves
+            cur = self._conn.execute(
+                "DELETE FROM nodes WHERE status = 'deleted'"
+            )
+            purged = cur.rowcount
+            self._conn.commit()
+        logger.info(f"Purged {purged} deleted nodes")
+        return purged
+
+    def invalidate_old_facts(self, entity_name: str, category: str, exclude_node_id: str = None) -> int:
+        """Mark old facts about an entity as superseded (valid_until = now).
+
+        Called when a new fact about the same entity is captured.
+        Uses multiple matching strategies:
+        1. Entity name in fact_entities JSON array
+        2. Entity name substring in content
+        3. Category keyword overlap (for phone/email/address etc.)
+        Returns the number of facts invalidated.
+        """
+        from datetime import datetime
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        name_lower = entity_name.lower()
+
+        # Strategy 1: Entity name in content (substring match)
+        # Strategy 2: Same category with overlapping contact keywords
+        contact_keywords = ["手机号", "电话", "邮箱", "地址", "微信", "qq"]
+        is_contact = any(kw in name_lower for kw in contact_keywords)
+
+        entity_match = "(LOWER(json_extract(properties, '$.fact_entities')) LIKE ? OR LOWER(json_extract(properties, '$.content')) LIKE ?)"
+        where_parts = [
+            "status = 'active'",
+            "label = 'fact'",
+            "json_extract(properties, '$.fact_category') = ?",
+            entity_match,
+        ]
+        params = [category, f'%{name_lower}%', f'%{name_lower}%']
+
+        if exclude_node_id:
+            where_parts.append("id != ?")
+            params.append(exclude_node_id)
+        where_parts.append("valid_until IS NULL")
+        where_sql = " AND ".join(where_parts)
+
+        with self._write_lock:
+            cur = self._conn.execute(f"""
+                UPDATE nodes
+                   SET valid_until = ?,
+                       updated_at = CURRENT_TIMESTAMP
+                 WHERE {where_sql}
+            """, [now_str] + params)
+            invalidated = cur.rowcount
+
+            # Strategy 3: For contact facts, also invalidate same-category facts
+            # with overlapping contact keywords in content
+            if is_contact and invalidated == 0:
+                for kw in contact_keywords:
+                    if kw in name_lower:
+                        kw_match = "LOWER(json_extract(properties, '$.content')) LIKE ?"
+                        where_parts2 = [
+                            "status = 'active'",
+                            "label = 'fact'",
+                            "json_extract(properties, '$.fact_category') = ?",
+                            kw_match,
+                        ]
+                        params2 = [category, f'%{kw}%']
+                        if exclude_node_id:
+                            where_parts2.append("id != ?")
+                            params2.append(exclude_node_id)
+                        where_parts2.append("valid_until IS NULL")
+                        where_sql2 = " AND ".join(where_parts2)
+                        cur2 = self._conn.execute(f"""
+                            UPDATE nodes
+                               SET valid_until = ?,
+                                   updated_at = CURRENT_TIMESTAMP
+                             WHERE {where_sql2}
+                        """, [now_str] + params2)
+                        invalidated += cur2.rowcount
+
+            self._conn.commit()
+        return invalidated
+
+    def get_active_facts(self, entity_name: str = None, category: str = None, limit: int = 20) -> List[Dict]:
+        """Get currently active facts (valid_until IS NULL)."""
+        where = [
+            "status = 'active'",
+            "label = 'fact'",
+            "valid_until IS NULL",
+        ]
+        params = []
+        if entity_name:
+            where.append("json_extract(properties, '$.fact_entities') LIKE ?")
+            params.append(f'%"{entity_name}"%')
+        if category:
+            where.append("json_extract(properties, '$.fact_category') = ?")
+            params.append(category)
+        where_sql = " AND ".join(where)
+        params.append(limit)
+        cur = self._conn.execute(f"""
+            SELECT id, label, properties, created_at, updated_at,
+                   last_accessed_at, access_count, importance, ttl_days,
+                   valid_from, valid_until, status, source_agent_id, department
+              FROM nodes
+             WHERE {where_sql}
+             ORDER BY datetime(created_at) DESC
+             LIMIT ?
+        """, tuple(params))
+        return [self._row_to_node(r) for r in cur.fetchall()]
+
+    def get_fact_timeline(self, entity_name: str, limit: int = 20) -> List[Dict]:
+        """Get time-ordered facts about an entity (current + historical)."""
+        cur = self._conn.execute("""
+            SELECT id, label, properties, created_at, updated_at,
+                   last_accessed_at, access_count, importance, ttl_days,
+                   valid_from, valid_until, status, source_agent_id, department
+              FROM nodes
+             WHERE status = 'active'
+               AND label = 'fact'
+               AND (json_extract(properties, '$.fact_entities') LIKE ?
+                    OR LOWER(json_extract(properties, '$.content')) LIKE ?)
+             ORDER BY
+               CASE WHEN valid_until IS NULL THEN 0 ELSE 1 END,
+               datetime(created_at) DESC
+             LIMIT ?
+        """, (f'%"{entity_name}"%', f'%{entity_name.lower()}%', limit))
+        return [self._row_to_node(r) for r in cur.fetchall()]
 
     def close(self):
         if self._conn:

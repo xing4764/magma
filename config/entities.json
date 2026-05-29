@@ -1,0 +1,30 @@
+{
+  "_comment": "MAGMA entity dictionary. Add custom entities here. Format: {\"name\": \"type\"}",
+  "entities": {
+    "MAGMA": "system",
+    "GBrain": "system",
+    "OpenClaw": "system",
+    "MCP": "protocol",
+    "FAISS": "storage",
+    "SQLite": "storage",
+    "FastAPI": "api",
+    "magma-recall": "plugin",
+    "memory-core": "plugin",
+    "腾讯插件": "plugin",
+    "冰丝凉感": "selling_point",
+    "凉爽透气": "selling_point",
+    "抖店草稿": "document",
+    "抖音电商": "domain",
+    "飞书": "system",
+    "Scrapling": "tool",
+    "Playwright": "tool",
+    "Docker": "tool",
+    "GitHub": "platform",
+    "Notion": "platform"
+  },
+  "patterns": {
+    "sku": "\\b[A-Z]{1,4}\\d{2,6}\\b",
+    "model": "\\b(?:bge-small-zh-v1\\.5|MiniLM-L6-v2|text2vec-base-chinese)\\b"
+  },
+  "custom_entities_file": "config/custom_entities.json"
+}

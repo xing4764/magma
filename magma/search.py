@@ -4,8 +4,9 @@ import json
 import logging
 import math
 import re
+import time
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 
@@ -439,6 +440,94 @@ def _promote_operational_anchor(results: List[Dict[str, Any]], top_k: int, query
     return selected[:top_k]
 
 
+# --- Graph Walk Cache (module-level, 5-min TTL) ---
+_graph_walk_cache: Dict[str, Tuple[float, Dict[str, float]]] = {}
+_GRAPH_WALK_TTL = 300  # 5 minutes
+_GRAPH_WALK_MAX_CACHE = 512
+
+
+def _cache_key(node_ids: List[str], hops: int) -> str:
+    return "|".join(sorted(node_ids)) + f":h{hops}"
+
+
+def _cache_get(key: str) -> Optional[Dict[str, float]]:
+    entry = _graph_walk_cache.get(key)
+    if entry is None:
+        return None
+    ts, data = entry
+    if time.time() - ts > _GRAPH_WALK_TTL:
+        del _graph_walk_cache[key]
+        return None
+    return data
+
+
+def _cache_put(key: str, data: Dict[str, float]):
+    if len(_graph_walk_cache) >= _GRAPH_WALK_MAX_CACHE:
+        # Evict oldest entries
+        oldest_keys = sorted(_graph_walk_cache, key=lambda k: _graph_walk_cache[k][0])[:64]
+        for k in oldest_keys:
+            _graph_walk_cache.pop(k, None)
+    _graph_walk_cache[key] = (time.time(), data)
+
+
+def graph_walk(store, source_node_ids: List[str], hops: int = 2, max_neighbors_per_hop: int = 15) -> Dict[str, float]:
+    """Walk the graph from source nodes, returning {node_id: graph_score}.
+
+    Score: 1-hop = 0.3, 2-hop = 0.15.  Uses SQLite queries (not in-memory graph).
+    Results are cached for 5 minutes.
+    """
+    if not source_node_ids:
+        return {}
+
+    cache_key = _cache_key(source_node_ids, hops)
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    # BFS-style traversal
+    visited: Set[str] = set(source_node_ids)
+    result: Dict[str, float] = {}  # node_id -> graph score
+    current_frontier = set(source_node_ids)
+    hop_scores = {1: 0.3, 2: 0.15}
+    # Relation-type weights for graph walk scoring
+    relation_weights = {
+        "depends_on": 1.3,
+        "caused_by": 1.3,
+        "responded_by": 1.2,
+        "same_as": 1.15,
+        "mentions_entity": 1.0,
+        "extracted_fact": 1.1,
+        "related_to": 1.0,
+    }
+
+    for hop in range(1, hops + 1):
+        if not current_frontier:
+            break
+        next_frontier: Set[str] = set()
+        try:
+            neighbors_with_rel = store.get_neighbor_ids_with_relations(list(current_frontier))
+            for item in neighbors_with_rel:
+                nid = item["id"]
+                rel = item["relation"]
+                if nid and nid not in visited:
+                    visited.add(nid)
+                    next_frontier.add(nid)
+                    base_score = hop_scores.get(hop, 0.1)
+                    rel_weight = relation_weights.get(rel, 1.0)
+                    weighted_score = base_score * rel_weight
+                    if nid not in result or result[nid] < weighted_score:
+                        result[nid] = weighted_score
+        except Exception as e:
+            logger.warning(f"graph_walk hop {hop} error: {e}")
+            break
+        current_frontier = next_frontier
+
+    # Only cache non-empty results
+    if result:
+        _cache_put(cache_key, result)
+    return result
+
+
 class MemorySearcher:
     """Semantic + lexical retrieval with lifecycle-aware ranking."""
 
@@ -634,6 +723,97 @@ class MemorySearcher:
             results.append(node)
 
         results.sort(key=lambda item: item["score"], reverse=True)
+
+        # --- P0: Graph Walk Engine (HippoRAG-style) ---
+        # Take top-K candidates from FAISS+keyword scoring, walk 2 hops on graph
+        if len(results) > 0:
+            graph_seed_size = min(max(top_k * 2, 10), len(results))
+            seed_ids = [item["id"] for item in results[:graph_seed_size]]
+            graph_scores = graph_walk(self.store, seed_ids, hops=2)
+
+            if graph_scores:
+                existing_ids = {item["id"] for item in results}
+                # Re-score existing results with graph boost
+                for item in results:
+                    gid = item["id"]
+                    if gid in graph_scores:
+                        original_score = item["score"]
+                        graph_score = graph_scores[gid]
+                        fused = original_score * 0.7 + graph_score * 0.3
+                        item["score"] = round(fused, 6)
+                        item["graph_boost"] = True
+                        item["graph_score"] = graph_score
+                        item["score_breakdown"]["graph_score"] = round(graph_score, 4)
+                        item["score_breakdown"]["fused_score"] = round(fused, 4)
+
+                # Fetch graph-discovered nodes not in original results
+                new_node_ids = [nid for nid in graph_scores if nid not in existing_ids]
+                if new_node_ids:
+                    fetched = []
+                    for nid in new_node_ids[:30]:  # Cap fetched neighbors
+                        node = self.store.get_node(nid)
+                        if node and node.get("status") != "deleted":
+                            fetched.append(node)
+                    # Score fetched graph neighbors
+                    for node in fetched:
+                        nid = node["id"]
+                        searchable = _node_searchable_text(node)
+                        keyword_score = _keyword_score(query, node, searchable, query_terms)
+                        semantic_score = faiss_semantic.get(nid, 0.0)
+                        base_score = semantic_score * 0.75 + keyword_score * 0.25
+                        lifecycle = _lifecycle_multiplier(node)
+                        agent_scope = _agent_scope_multiplier(node, filters)
+                        intent_scope = _intent_multiplier(node, intent)
+                        entity_scope = _entity_overlap_multiplier(query_entities, node)
+                        quality_scope = _memory_quality_multiplier(node)
+                        authority_scope = _operational_authority_multiplier(query, node, keyword_score)
+                        graph_score = graph_scores[nid]
+                        original_combined = (
+                            base_score
+                            * lifecycle * agent_scope * intent_scope
+                            * entity_scope * quality_scope * authority_scope
+                        )
+                        fused = original_combined * 0.7 + graph_score * 0.3
+                        if fused <= 0:
+                            continue
+                        provenance = _provenance(node)
+                        memory_scope = _memory_scope(node)
+                        node["score"] = round(float(fused), 6)
+                        node["score_breakdown"] = {
+                            "base": round(base_score, 4),
+                            "lifecycle": round(float(lifecycle), 4),
+                            "agent_scope": round(float(agent_scope), 4),
+                            "intent_scope": round(float(intent_scope), 4),
+                            "entity_scope": round(float(entity_scope), 4),
+                            "quality_scope": round(float(quality_scope), 4),
+                            "authority_scope": round(float(authority_scope), 4),
+                            "graph_score": round(graph_score, 4),
+                            "fused_score": round(float(fused), 4),
+                        }
+                        node["semantic_score"] = round(float(semantic_score), 6)
+                        node["keyword_score"] = round(float(keyword_score), 6)
+                        node["lifecycle_multiplier"] = round(float(lifecycle), 6)
+                        node["agent_scope_multiplier"] = round(float(agent_scope), 6)
+                        node["intent_multiplier"] = round(float(intent_scope), 6)
+                        node["entity_overlap_multiplier"] = round(float(entity_scope), 6)
+                        node["memory_quality_multiplier"] = round(float(quality_scope), 6)
+                        node["operational_authority_multiplier"] = round(float(authority_scope), 6)
+                        node["query_entities"] = query_entities
+                        node["query_scope"] = query_scope
+                        node["query_intent"] = intent
+                        node["memory_scope"] = memory_scope
+                        node["retrieval_source"] = "graph_walk"
+                        node["graph_boost"] = True
+                        node["graph_score"] = graph_score
+                        node["provenance"] = provenance
+                        node["source_agent_id"] = provenance.get("agent_id")
+                        node["memory_source"] = provenance.get("source")
+                        node["source_session_key"] = provenance.get("session_key")
+                        results.append(node)
+
+                # Re-sort with graph-boosted scores
+                results.sort(key=lambda item: item["score"], reverse=True)
+
         results = _promote_operational_anchor(results, top_k, query)
         results = _diversify_by_scope(results, top_k, query_scope)
         if include_related:

@@ -31,6 +31,7 @@ class FAISSIndex:
         self._index = None          # faiss.IndexFlatIP
         self._id_map: List[str] = []  # position -> node_id
         self._id_to_pos: Dict[str, int] = {}
+        self._embeddings: Dict[str, np.ndarray] = {}  # node_id -> embedding (for rebuild)
         self._lock = threading.Lock()
         self._built = False
 
@@ -65,23 +66,27 @@ class FAISSIndex:
                 self._index = None
                 self._id_map = []
                 self._id_to_pos = {}
+                self._embeddings = {}
                 self._built = True
             logger.info("FAISS index built with 0 vectors")
             return
 
         ids = []
         vectors = []
+        emb_cache = {}
         for node_id, vec in entries:
             if vec is None or vec.ndim != 1:
                 continue
             ids.append(node_id)
-            vectors.append(vec)
+            vectors.append(vec.astype(np.float32))
+            emb_cache[node_id] = vec.astype(np.float32)
 
         if not vectors:
             with self._lock:
                 self._index = None
                 self._id_map = []
                 self._id_to_pos = {}
+                self._embeddings = {}
                 self._built = True
             logger.info("FAISS index built with 0 valid vectors")
             return
@@ -101,6 +106,7 @@ class FAISSIndex:
             self._dimension = dim
             self._id_map = list(ids)
             self._id_to_pos = {nid: i for i, nid in enumerate(ids)}
+            self._embeddings = emb_cache
             self._built = True
 
         logger.info(f"FAISS index built: {len(ids)} vectors, dim={dim}")
@@ -127,17 +133,49 @@ class FAISSIndex:
             self._index.add(vec)
             self._id_map.append(node_id)
             self._id_to_pos[node_id] = len(self._id_map) - 1
+            self._embeddings[node_id] = embedding.astype(np.float32)
 
     def remove(self, node_id: str):
-        """Remove a vector by node_id (rebuilds internally since IndexFlatIP
-        doesn't support removal; marks as deleted and defers rebuild)."""
+        """Remove a vector by node_id.
+
+        Actually removes from the FAISS index by rebuilding without the
+        deleted entry. Uses cached embeddings to avoid re-fetching.
+        """
         if not _FAISS_AVAILABLE or not self._built:
             return
         with self._lock:
             if node_id not in self._id_to_pos:
                 return
-            pos = self._id_to_pos.pop(node_id)
-            self._id_map[pos] = None  # tombstone
+            # Remove from embeddings cache
+            self._embeddings.pop(node_id, None)
+            # Rebuild index without the deleted node
+            self._rebuild_without_deleted_locked()
+            logger.debug(f"FAISS removed {node_id}, index now has {self.count} vectors")
+
+    def _rebuild_without_deleted_locked(self):
+        """Rebuild the FAISS index using cached embeddings, excluding removed nodes.
+        Caller must hold self._lock."""
+        if not self._embeddings:
+            self._index = None
+            self._id_map = []
+            self._id_to_pos = {}
+            return
+
+        ids = list(self._embeddings.keys())
+        vectors = [self._embeddings[nid] for nid in ids]
+        mat = np.array(vectors, dtype=np.float32)
+        dim = mat.shape[1]
+
+        norms = np.linalg.norm(mat, axis=1, keepdims=True)
+        mat = mat / np.maximum(norms, 1e-10)
+
+        index = faiss.IndexFlatIP(dim)
+        index.add(mat)
+
+        self._index = index
+        self._dimension = dim
+        self._id_map = ids
+        self._id_to_pos = {nid: i for i, nid in enumerate(ids)}
 
     def search(self, query_embedding: np.ndarray, top_k: int = 5) -> List[Tuple[str, float]]:
         """Search for nearest neighbors.
@@ -179,6 +217,8 @@ class FAISSIndex:
 
     def rebuild(self, entries: List[Tuple[str, np.ndarray]]):
         """Full rebuild (alias for build_from_embeddings)."""
+        # Clear embeddings cache before rebuild
+        self._embeddings = {}
         self.build_from_embeddings(entries)
 
     def clear(self):
@@ -187,6 +227,7 @@ class FAISSIndex:
             self._index = None
             self._id_map = []
             self._id_to_pos = {}
+            self._embeddings = {}
             self._built = False
 
 
