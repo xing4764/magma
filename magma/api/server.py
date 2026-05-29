@@ -508,11 +508,11 @@ def create_app() -> FastAPI:
         return {"status": "ok", "id": node_id}
 
     @app.post("/api/v1/consolidate")
-    async def consolidate():
+    async def consolidate(purge_deleted: bool = False):
         from magma.graph.sqlite_store import get_store
 
         store = getattr(app.state, "store", None) or get_store()
-        return {"status": "ok", "stats": store.consolidate()}
+        return {"status": "ok", "stats": store.consolidate(purge_deleted=purge_deleted)}
 
     @app.post("/api/v1/backup")
     async def backup():

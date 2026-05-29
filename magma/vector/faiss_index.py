@@ -112,7 +112,7 @@ class FAISSIndex:
         logger.info(f"FAISS index built: {len(ids)} vectors, dim={dim}")
 
     def add(self, node_id: str, embedding: np.ndarray):
-        """Add a single vector to the index."""
+        """Add a single vector to the index. If node_id already exists, replaces it (upsert)."""
         if not _FAISS_AVAILABLE or not self._built:
             return
         if embedding is None or embedding.ndim != 1:
@@ -124,6 +124,10 @@ class FAISSIndex:
             vec = vec / norm
 
         with self._lock:
+            # Upsert: remove old entry if exists
+            if node_id in self._id_to_pos:
+                self._remove_locked(node_id)
+
             if self._index is None:
                 self._index = faiss.IndexFlatIP(vec.shape[1])
                 self._dimension = vec.shape[1]
@@ -134,6 +138,25 @@ class FAISSIndex:
             self._id_map.append(node_id)
             self._id_to_pos[node_id] = len(self._id_map) - 1
             self._embeddings[node_id] = embedding.astype(np.float32)
+
+    def _remove_locked(self, node_id: str):
+        """Internal remove (must hold self._lock). Uses rebuild approach."""
+        if node_id not in self._id_to_pos:
+            return
+        # Rebuild index without this node
+        keep_entries = [(nid, emb) for nid, emb in self._embeddings.items() if nid != node_id]
+        del self._embeddings[node_id]
+        if keep_entries:
+            ids, vecs = zip(*keep_entries)
+            mat = np.array(vecs, dtype=np.float32)
+            self._index = faiss.IndexFlatIP(mat.shape[1])
+            self._index.add(mat)
+            self._id_map = list(ids)
+            self._id_to_pos = {nid: i for i, nid in enumerate(self._id_map)}
+        else:
+            self._index = None
+            self._id_map = []
+            self._id_to_pos = {}
 
     def remove(self, node_id: str):
         """Remove a vector by node_id.

@@ -54,6 +54,9 @@ class Encoder:
 
     @property
     def dimension(self) -> int:
+        # Compatible with both old (get_sentence_embedding_dimension) and new (get_embedding_dimension)
+        if hasattr(self.model, 'get_embedding_dimension'):
+            return self.model.get_embedding_dimension()
         return self.model.get_sentence_embedding_dimension()
 
 

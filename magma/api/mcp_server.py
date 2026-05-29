@@ -583,50 +583,40 @@ async def _handle_timeline(args: Dict[str, Any]) -> List[TextContent]:
 
 async def _handle_entity_add(args: Dict[str, Any]) -> List[TextContent]:
     """Add a custom entity to the entity dictionary."""
-    name = args["name"]
-    entity_type = args["entity_type"]
     try:
-        from magma.entities import add_custom_entity
-        added = add_custom_entity(name, entity_type)
-        if added:
-            return [TextContent(type="text", text=f"Entity '{name}' ({entity_type}) added to custom dictionary.")]
-        else:
+        result = _api_request("POST", "/api/v1/entities", {
+            "name": args["name"],
+            "entity_type": args["entity_type"],
+        })
+        status = result.get("status", "ok")
+        name = result.get("name", args["name"])
+        entity_type = result.get("entity_type", args["entity_type"])
+        if status == "already_exists":
             return [TextContent(type="text", text=f"Entity '{name}' already exists in custom dictionary.")]
+        return [TextContent(type="text", text=f"Entity '{name}' ({entity_type}) added to custom dictionary.")]
     except Exception as e:
         return [TextContent(type="text", text=f"Error adding entity: {e}")]
 
 
 async def _handle_entity_remove(args: Dict[str, Any]) -> List[TextContent]:
     """Remove a custom entity from the entity dictionary."""
-    name = args["name"]
     try:
-        from magma.entities import remove_custom_entity
-        removed = remove_custom_entity(name)
-        if removed:
-            return [TextContent(type="text", text=f"Entity '{name}' removed from custom dictionary.")]
-        else:
-            return [TextContent(type="text", text=f"Entity '{name}' not found in custom dictionary.")]
-    except Exception as e:
+        name_encoded = urllib.parse.quote(args["name"], safe="")
+        result = _api_request("DELETE", f"/api/v1/entities/{name_encoded}")
+        return [TextContent(type="text", text=f"Entity '{args['name']}' removed from custom dictionary.")]
+    except RuntimeError as e:
+        if "404" in str(e):
+            return [TextContent(type="text", text=f"Entity '{args['name']}' not found in custom dictionary.")]
         return [TextContent(type="text", text=f"Error removing entity: {e}")]
 
 
 async def _handle_entity_list(args: Dict[str, Any]) -> List[TextContent]:
     """List all known entities."""
     try:
-        from magma.entities import list_entities
-        entities = list_entities()
-        # Group by source
-        config_entities = {k: v for k, v in entities.items() if v.get("source") == "config"}
-        custom_entities = {k: v for k, v in entities.items() if v.get("source") == "custom"}
-        output = {
-            "total": len(entities),
-            "config": {"count": len(config_entities), "entities": config_entities},
-            "custom": {"count": len(custom_entities), "entities": custom_entities},
-        }
-        return [TextContent(type="text", text=json.dumps(output, ensure_ascii=False, indent=2))]
+        result = _api_request("GET", "/api/v1/entities")
+        return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
     except Exception as e:
         return [TextContent(type="text", text=f"Error listing entities: {e}")]
-
 
 async def main():
     logger.info(f"MAGMA MCP Server starting (proxy mode -> {API_BASE})")

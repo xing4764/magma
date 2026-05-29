@@ -107,6 +107,17 @@ class SQLiteStore:
             if name not in existing:
                 self._conn.execute(f"ALTER TABLE nodes ADD COLUMN {name} {definition}")
 
+        # Migrate recall_events table: add source_agent_id / department if missing
+        cur = self._conn.execute("PRAGMA table_info(recall_events)")
+        recall_existing = {row["name"] for row in cur.fetchall()}
+        recall_columns = {
+            "source_agent_id": "TEXT",
+            "department": "TEXT",
+        }
+        for name, definition in recall_columns.items():
+            if name not in recall_existing:
+                self._conn.execute(f"ALTER TABLE recall_events ADD COLUMN {name} {definition}")
+
     def add_node(self, node_id: str, label: str, properties: Dict = None, embedding=None):
         properties = properties or {}
         props = json.dumps(properties, ensure_ascii=False)
@@ -488,11 +499,12 @@ class SQLiteStore:
             "updates": updates,
         }
 
-    def consolidate(self, semantic_dedup: bool = True) -> Dict[str, int]:
+    def consolidate(self, semantic_dedup: bool = True, purge_deleted: bool = False) -> Dict[str, int]:
         """Run all consolidation steps including optional semantic dedup.
         
         Args:
             semantic_dedup: If True, also run FAISS-based semantic duplicate detection.
+            purge_deleted: If True, physically remove soft-deleted nodes. Default False.
         """
         v2_stats = {}
         if semantic_dedup:
@@ -609,8 +621,8 @@ class SQLiteStore:
 
             self._conn.commit()
 
-        # Physically purge soft-deleted nodes
-        purged = self.purge_deleted()
+        # Physically purge soft-deleted nodes only when explicitly requested
+        purged = self.purge_deleted() if purge_deleted else 0
 
         return {
             "removed_duplicate_edges": removed_edges,
