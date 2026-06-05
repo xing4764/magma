@@ -150,6 +150,7 @@ class QueryResponse(BaseModel):
     references: Optional[list] = None
     token_budget: Optional[int] = None
     tokens_used: Optional[int] = None
+    short_command_resolution: Optional[dict] = None
 
 
 class FeedbackRequest(BaseModel):
@@ -294,6 +295,16 @@ def create_app() -> FastAPI:
             import traceback
             logger.warning(traceback.format_exc())
 
+        # Extract short_command_resolution from results if present
+        short_cmd_resolution = None
+        if results and isinstance(results[0], dict):
+            scr = results[0].get("short_command_resolution")
+            if scr:
+                short_cmd_resolution = scr.get("short_command_resolution")
+                # Also add top-level fields for easier access
+                if short_cmd_resolution:
+                    short_cmd_resolution["drift_warning"] = results[0].get("short_command_drift_warning", False)
+
         return QueryResponse(
             query=req.query,
             results=results,
@@ -303,6 +314,7 @@ def create_app() -> FastAPI:
             references=narrative_data.get("references") if narrative_data else None,
             token_budget=narrative_data.get("token_budget") if narrative_data else None,
             tokens_used=narrative_data.get("tokens_used") if narrative_data else None,
+            short_command_resolution=short_cmd_resolution,
         )
 
     @app.post("/api/v1/nodes")

@@ -158,7 +158,12 @@ async function queryMagma(cfg, text, context = {}) {
   if (!res.ok) throw new Error(`MAGMA query failed: HTTP ${res.status}`);
   const body = await res.json();
   const results = Array.isArray(body.results) ? body.results : [];
-  return await mergeOperationalAnchors(cfg, text, results);
+  const merged = await mergeOperationalAnchors(cfg, text, results);
+  // Attach short_command_resolution metadata if present
+  if (body.short_command_resolution) {
+    merged._shortCommandResolution = body.short_command_resolution;
+  }
+  return merged;
 }
 
 function anchorIdsForText(text) {
@@ -543,7 +548,9 @@ export default function register(api) {
           ts: Date.now(),
         });
       }
-      writeAudit(cfg, {
+      // Extract short_command_resolution metadata if present
+      const shortCmdRes = results._shortCommandResolution || null;
+      const auditEntry = {
         agentId,
         sessionKey: ctx?.sessionKey,
         eventId,
@@ -551,7 +558,21 @@ export default function register(api) {
         resultCount: filtered.length,
         recalled: filtered.map((item) => item.id),
         queryPreview: userText.slice(0, 120),
-      });
+      };
+      if (shortCmdRes) {
+        auditEntry.short_command = true;
+        auditEntry.short_command_agent_id = shortCmdRes.agent_id || agentId;
+        auditEntry.short_command_session_key = shortCmdRes.session_key || ctx?.sessionKey;
+        auditEntry.short_command_resolved_action = shortCmdRes.action_hint || null;
+        auditEntry.short_command_confidence = shortCmdRes.confidence || null;
+        auditEntry.short_command_evidence_node_ids = shortCmdRes.context_node_ids || [];
+        auditEntry.short_command_drift_warning = shortCmdRes.drift_warning || false;
+        api.logger.info?.(
+          `${TAG} short command resolved: action='${shortCmdRes.action_hint}', ` +
+          `confidence=${shortCmdRes.confidence}, drift_warning=${shortCmdRes.drift_warning}`
+        );
+      }
+      writeAudit(cfg, auditEntry);
       if (!prependContext) {
         api.logger.info?.(`${TAG} recall complete (${durationMs}ms), no context`);
         return;
