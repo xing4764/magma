@@ -145,6 +145,7 @@ function extractUserText(event) {
 async function queryMagma(cfg, text, context = {}) {
   const filters = { include_related: true, related_limit: 2, include_versions: true, version_limit: 2, pool_size: 5000 };
   if (context.agentId) filters.current_agent_id = context.agentId;
+  if (context.sessionKey) filters.session_key = context.sessionKey;
   const res = await fetchWithTimeout(
     `${cfg.apiBaseUrl}/api/v1/query`,
     {
@@ -526,7 +527,7 @@ export default function register(api) {
 
     try {
       await ensureApiStarted(cfg, api.logger);
-      const results = await queryMagma(cfg, userText, { agentId });
+      const results = await queryMagma(cfg, userText, { agentId, sessionKey: ctx?.sessionKey });
       const filtered = results.filter((item) => typeof item.score !== "number" || item.score >= cfg.scoreThreshold);
       const prependContext = formatMemories(filtered);
       const durationMs = Date.now() - started;

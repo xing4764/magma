@@ -1146,10 +1146,7 @@ class SQLiteStore:
 
         # Filter by agent_id if provided
         if agent_id:
-            where.append("(
-                source_agent_id = ? OR
-                json_extract(properties, '$.agent_id') = ?
-            )")
+            where.append("(source_agent_id = ? OR json_extract(properties, '$.agent_id') = ?)")
             params.extend([agent_id, agent_id])
 
         # Filter by session_key if provided
@@ -1184,12 +1181,14 @@ class SQLiteStore:
     def get_pending_decisions(
         self,
         agent_id: str = None,
+        session_key: str = None,
         hours: int = 24,
         limit: int = 5,
     ) -> List[Dict]:
         """Get recent L1 decision/task_intent nodes.
 
         These are the highest-priority targets for short command binding.
+        Filtered by agent_id and session_key when provided (same scope as caller).
         """
         where = [
             "status = 'active'",
@@ -1199,11 +1198,12 @@ class SQLiteStore:
         params = []
 
         if agent_id:
-            where.append("(
-                source_agent_id = ? OR
-                json_extract(properties, '$.agent_id') = ?
-            )")
+            where.append("(source_agent_id = ? OR json_extract(properties, '$.agent_id') = ?)")
             params.extend([agent_id, agent_id])
+
+        if session_key:
+            where.append("json_extract(properties, '$.session_key') = ?")
+            params.append(session_key)
 
         if hours:
             cutoff = (datetime.utcnow() - timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")

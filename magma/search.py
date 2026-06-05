@@ -869,12 +869,15 @@ class MemorySearcher:
         # resolve it against recent conversation context first.
         short_cmd_result = None
         if is_short_command(query):
-            logger.info(f"Short command detected: '{query}' — attempting context resolution")
             # Get recent conversation nodes for context
             recent_nodes = []
             try:
                 agent_id = filters.get("agent_id") or filters.get("current_agent_id")
                 session_key = filters.get("session_key")
+                logger.info(
+                    f"Short command detected: '{query}' — "
+                    f"agent_id={agent_id}, session_key={session_key}"
+                )
                 recent_nodes = self.store.get_recent_conversation(
                     agent_id=agent_id,
                     session_key=session_key,
@@ -882,8 +885,10 @@ class MemorySearcher:
                     hours=24,
                 )
                 # Also check L1 decision nodes (highest priority)
+                # Filter by same session when session_key is provided
                 pending_decisions = self.store.get_pending_decisions(
                     agent_id=agent_id,
+                    session_key=session_key,
                     hours=24,
                     limit=5,
                 )
