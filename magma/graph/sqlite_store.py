@@ -1128,6 +1128,103 @@ class SQLiteStore:
         """, (f'%"{entity_name}"%', f'%{entity_name.lower()}%', limit))
         return [self._row_to_node(r) for r in cur.fetchall()]
 
+    def get_recent_conversation(
+        self,
+        agent_id: str = None,
+        session_key: str = None,
+        limit: int = 10,
+        hours: int = 24,
+    ) -> List[Dict]:
+        """Get recent conversation nodes for short command resolution.
+
+        Returns the most recent conversation nodes ordered by time,
+        filtered by agent_id and/or session_key.
+        Used to resolve short commands like "更新", "开始", "继续".
+        """
+        where = ["status = 'active'"]
+        params = []
+
+        # Filter by agent_id if provided
+        if agent_id:
+            where.append("(
+                source_agent_id = ? OR
+                json_extract(properties, '$.agent_id') = ?
+            )")
+            params.extend([agent_id, agent_id])
+
+        # Filter by session_key if provided
+        if session_key:
+            where.append("json_extract(properties, '$.session_key') = ?")
+            params.append(session_key)
+
+        # Time filter (default: last 24 hours)
+        if hours:
+            cutoff = (datetime.utcnow() - timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
+            where.append("datetime(created_at) >= ?")
+            params.append(cutoff)
+
+        where_sql = " AND ".join(where)
+        params.append(limit)
+
+        cur = self._conn.execute(f"""
+            SELECT id, label, properties, created_at, updated_at,
+                   last_accessed_at, access_count, importance, ttl_days,
+                   valid_from, valid_until, status, source_agent_id, department
+              FROM nodes
+             WHERE {where_sql}
+             ORDER BY datetime(created_at) DESC
+             LIMIT ?
+        """, tuple(params))
+
+        nodes = [self._row_to_node(r) for r in cur.fetchall()]
+        # Return in chronological order (oldest first)
+        nodes.reverse()
+        return nodes
+
+    def get_pending_decisions(
+        self,
+        agent_id: str = None,
+        hours: int = 24,
+        limit: int = 5,
+    ) -> List[Dict]:
+        """Get recent L1 decision/task_intent nodes.
+
+        These are the highest-priority targets for short command binding.
+        """
+        where = [
+            "status = 'active'",
+            "json_extract(properties, '$.layer') = 'L1'",
+            "json_extract(properties, '$.kind') IN ('decision', 'task_intent')",
+        ]
+        params = []
+
+        if agent_id:
+            where.append("(
+                source_agent_id = ? OR
+                json_extract(properties, '$.agent_id') = ?
+            )")
+            params.extend([agent_id, agent_id])
+
+        if hours:
+            cutoff = (datetime.utcnow() - timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
+            where.append("datetime(created_at) >= ?")
+            params.append(cutoff)
+
+        where_sql = " AND ".join(where)
+        params.append(limit)
+
+        cur = self._conn.execute(f"""
+            SELECT id, label, properties, created_at, updated_at,
+                   last_accessed_at, access_count, importance, ttl_days,
+                   valid_from, valid_until, status, source_agent_id, department
+              FROM nodes
+             WHERE {where_sql}
+             ORDER BY datetime(created_at) DESC
+             LIMIT ?
+        """, tuple(params))
+
+        return [self._row_to_node(r) for r in cur.fetchall()]
+
     def close(self):
         if self._conn:
             self._conn.close()

@@ -11,6 +11,11 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 import numpy as np
 
 from magma.entities import classify_memory_scope, extract_entities
+from magma.short_command import (
+    is_short_command,
+    resolve_short_command,
+    build_short_command_response,
+)
 
 logger = logging.getLogger("magma.search")
 
@@ -858,6 +863,54 @@ class MemorySearcher:
         filters: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
         filters = filters or {}
+
+        # --- Short Command Resolution ---
+        # When query is a short command (e.g., "更新", "开始", "可以"),
+        # resolve it against recent conversation context first.
+        short_cmd_result = None
+        if is_short_command(query):
+            logger.info(f"Short command detected: '{query}' — attempting context resolution")
+            # Get recent conversation nodes for context
+            recent_nodes = []
+            try:
+                agent_id = filters.get("agent_id") or filters.get("current_agent_id")
+                session_key = filters.get("session_key")
+                recent_nodes = self.store.get_recent_conversation(
+                    agent_id=agent_id,
+                    session_key=session_key,
+                    limit=10,
+                    hours=24,
+                )
+                # Also check L1 decision nodes (highest priority)
+                pending_decisions = self.store.get_pending_decisions(
+                    agent_id=agent_id,
+                    hours=24,
+                    limit=5,
+                )
+                # Merge: pending decisions first, then recent conversation
+                if pending_decisions:
+                    seen_ids = {n["id"] for n in pending_decisions}
+                    for n in recent_nodes:
+                        if n["id"] not in seen_ids:
+                            pending_decisions.append(n)
+                    recent_nodes = pending_decisions
+            except Exception as e:
+                logger.warning(f"Failed to get recent context for short command: {e}")
+
+            if recent_nodes:
+                short_cmd_result = resolve_short_command(query, recent_nodes, store=self.store)
+                if short_cmd_result and short_cmd_result.get("resolved"):
+                    logger.info(
+                        f"Short command '{query}' resolved: "
+                        f"source={short_cmd_result['pending_action']['source']}, "
+                        f"confidence={short_cmd_result['confidence']:.2f}"
+                    )
+                    # Inject context nodes into search results with high priority
+                    # by boosting their scores
+                    filters["_short_cmd_resolution"] = short_cmd_result
+                    filters["_short_cmd_boost_ids"] = [
+                        n["id"] for n in short_cmd_result.get("context_nodes", [])
+                    ]
         include_archived = bool(filters.get("include_archived", False))
         label = filters.get("label")
         pool_size = int(filters.get("pool_size", 99999))
@@ -1030,6 +1083,33 @@ class MemorySearcher:
             results.append(node)
 
         results.sort(key=lambda item: item["score"], reverse=True)
+
+        # --- Short Command Context Boost ---
+        # When a short command was resolved, boost the context nodes to the top
+        short_cmd_boost_ids = filters.get("_short_cmd_boost_ids") or []
+        short_cmd_resolution = filters.get("_short_cmd_resolution")
+        if short_cmd_boost_ids and short_cmd_resolution:
+            # Boost context nodes: multiply score by 3.0 to ensure they rank first
+            SHORT_CMD_BOOST = 3.0
+            for item in results:
+                if item["id"] in short_cmd_boost_ids:
+                    original = item["score"]
+                    item["score"] = round(original * SHORT_CMD_BOOST, 6)
+                    item["score_breakdown"]["short_cmd_boost"] = SHORT_CMD_BOOST
+                    item["short_command_resolved"] = True
+                    item["resolution_source"] = short_cmd_resolution["pending_action"]["source"]
+                    logger.info(
+                        f"Short cmd boost: {item['id']} "
+                        f"score {original:.4f} -> {item['score']:.4f}"
+                    )
+
+            # Also inject resolution metadata into the first result
+            if results and short_cmd_resolution.get("is_confirmation"):
+                results[0]["short_command_resolution"] = build_short_command_response(
+                    short_cmd_resolution
+                )
+
+            results.sort(key=lambda item: item["score"], reverse=True)
 
         # --- P0: Graph Walk Engine (HippoRAG-style) ---
         # Take top-K candidates from FAISS+keyword scoring, walk 2 hops on graph
@@ -1291,6 +1371,24 @@ class MemorySearcher:
                     causal_boost = 1.0 + 0.3 * len(causal_edges)
                     item["score"] = round(item["score"] * min(causal_boost, 2.0), 6)
                     item["score_breakdown"]["causal_boost"] = round(causal_boost, 4)
+
+        # --- Short Command Anti-Drift Check ---
+        # If short command was resolved but top results don't match context,
+        # add a warning flag for the caller
+        if short_cmd_resolution and short_cmd_boost_ids:
+            top_result_ids = {item["id"] for item in results[:top_k]}
+            context_in_top = any(nid in top_result_ids for nid in short_cmd_boost_ids)
+            if not context_in_top:
+                logger.warning(
+                    f"Short command anti-drift: resolved context nodes not in top-{top_k} results. "
+                    f"Context: {short_cmd_boost_ids}, Top: {[r['id'] for r in results[:top_k]]}"
+                )
+                # Inject a warning into the first result
+                if results:
+                    results[0]["short_command_drift_warning"] = True
+                    results[0]["short_command_resolution"] = build_short_command_response(
+                        short_cmd_resolution
+                    )
 
         self.store.touch_nodes([item["id"] for item in results])
         return results
