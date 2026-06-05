@@ -19,7 +19,7 @@ NOISE_PATTERNS = (
 
 STRONG_PATTERNS = (
     r"老板偏好|长期要求|以后.*优先|必须|不要|不能",
-    r"决策|确认|最终方案|上线|回退|版本|配置|端口|API|MCP",
+    r"决策|确认|最终方案|上线|回退|版本|配置|端口|接口变更|API\s*(?:端点|接口|变更|配置)|MCP",
     r"失败根因|根因|修复|故障|卡住|限流",
     r"SKU|尺码|身高|体重|商品|上架|抖音小店|价格|库存",
     r"core memory|core_memory|MAGMA|OpenClaw",
