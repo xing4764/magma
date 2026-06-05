@@ -651,6 +651,7 @@ export default function register(api) {
           durationMs,
           written: result.written || [],
           count: result.count || 0,
+          captureDecision: result.capture_decision || null,
           feedback: feedbackResult?.feedback,
           queryPreview: userText.slice(0, 120),
         });

@@ -1,8 +1,8 @@
 """Recall-quality benchmark for MAGMA.
 
-The live recall cases verify that important operational memories are retrieved
-from the running MAGMA API. Local checks cover routing behavior that should not
-depend on the current production database, such as short-command parsing.
+Live recall cases verify that important operational memories are retrieved
+from the running MAGMA API. Local checks cover routing and capture behavior
+that should not depend on the current production database.
 """
 
 import argparse
@@ -149,6 +149,7 @@ def score_live_case(case: dict, results: list) -> dict:
 
 
 def run_local_checks() -> list:
+    from magma.capture_policy import classify_capture
     from magma.short_command import is_short_command, normalize_short_command_query
 
     cases = [
@@ -166,6 +167,21 @@ def run_local_checks() -> list:
             "id": "short_command_rejection",
             "category": "short_command",
             "ok": is_short_command("取消"),
+        },
+        {
+            "id": "capture_policy_noise",
+            "category": "capture_policy",
+            "ok": classify_capture("OK", "").should_capture is False,
+        },
+        {
+            "id": "capture_policy_strong",
+            "category": "capture_policy",
+            "ok": classify_capture("老板偏好：MAGMA 必须真实可用", "").should_capture is True,
+        },
+        {
+            "id": "capture_policy_suppression",
+            "category": "capture_policy",
+            "ok": classify_capture("这是一条临时压制样例", "", ["临时压制样例"]).should_capture is False,
         },
     ]
     return [
@@ -219,17 +235,16 @@ def main() -> int:
 
     print(f"MAGMA recall eval: {total}/{max_total} ({summary['pct']}%)")
     for item in reports:
-        max_score = item.get("max_score", 2)
-        marker = "OK" if item.get("score") == max_score else "PARTIAL" if item.get("score") else "MISS"
-        print(
-            f"- {marker} {item['id']} [{item.get('category', 'live')}]: "
-            f"score={item.get('score')}/{max_score} matched={item.get('matched', [])} "
-            f"top={item.get('top_ids', [])}"
-        )
+        marker = "OK" if item.get("score", 0) == item.get("max_score", 2) else "WARN"
+        print(f"- [{marker}] {item['id']}: {item.get('score', 0)}/{item.get('max_score', 2)}")
+        if item.get("matched"):
+            print(f"  matched: {', '.join(item['matched'])}")
+        if item.get("top_ids"):
+            print(f"  top_ids: {', '.join(str(x) for x in item['top_ids'])}")
         if item.get("error"):
-            print(f"  error={item['error']}")
+            print(f"  error: {item['error']}")
     return 0 if summary["pass"] else 1
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(main())

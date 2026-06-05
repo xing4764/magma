@@ -120,6 +120,16 @@ class SQLiteStore:
             if name not in recall_existing:
                 self._conn.execute(f"ALTER TABLE recall_events ADD COLUMN {name} {definition}")
 
+        cur = self._conn.execute("PRAGMA table_info(recall_feedback)")
+        feedback_existing = {row["name"] for row in cur.fetchall()}
+        feedback_columns = {
+            "source_agent_id": "TEXT",
+            "department": "TEXT",
+        }
+        for name, definition in feedback_columns.items():
+            if name not in feedback_existing:
+                self._conn.execute(f"ALTER TABLE recall_feedback ADD COLUMN {name} {definition}")
+
     def add_node(self, node_id: str, label: str, properties: Dict = None, embedding=None):
         properties = properties or {}
         props = json.dumps(properties, ensure_ascii=False)
@@ -500,6 +510,198 @@ class SQLiteStore:
             "used": len(used),
             "updates": updates,
         }
+
+    def get_recall_event(self, event_id: str) -> Optional[Dict[str, Any]]:
+        """Return a stored recall event with decoded result payload."""
+        cur = self._conn.execute(
+            """
+            SELECT id, query, agent_id, session_key, results, used_node_ids,
+                   created_at, feedback_at, source_agent_id, department
+              FROM recall_events
+             WHERE id = ?
+            """,
+            (event_id,),
+        )
+        row = cur.fetchone()
+        if not row:
+            return None
+        return {
+            "id": row["id"],
+            "query": row["query"],
+            "agent_id": row["agent_id"],
+            "session_key": row["session_key"],
+            "results": json.loads(row["results"] or "[]"),
+            "used_node_ids": json.loads(row["used_node_ids"] or "[]"),
+            "created_at": row["created_at"],
+            "feedback_at": row["feedback_at"],
+            "source_agent_id": row["source_agent_id"],
+            "department": row["department"],
+        }
+
+    def explain_recall(
+        self,
+        query: str = None,
+        event_id: str = None,
+        node_id: str = None,
+    ) -> Dict[str, Any]:
+        """Explain why a memory was recalled using stored event/result metadata."""
+        event = self.get_recall_event(event_id) if event_id else None
+        selected = None
+
+        if event:
+            results = event.get("results") or []
+            if node_id:
+                selected = next((item for item in results if item.get("id") == node_id), None)
+            elif results:
+                selected = results[0]
+
+        node = self.get_node(node_id) if node_id else None
+        if not node and selected and selected.get("id"):
+            node = self.get_node(selected["id"])
+
+        explanation = {
+            "query": query or (event or {}).get("query"),
+            "event_id": event_id,
+            "node_id": node_id or (selected or {}).get("id"),
+            "event": event,
+            "node": node,
+            "score_breakdown": (selected or {}).get("score_breakdown") or {
+                key: (selected or {}).get(key)
+                for key in ("score", "semantic_score", "keyword_score", "rrf_score")
+                if key in (selected or {})
+            },
+            "provenance": (selected or {}).get("provenance") or {
+                "source_agent_id": (node or {}).get("source_agent_id"),
+                "department": (node or {}).get("department"),
+                "source": ((node or {}).get("properties") or {}).get("source"),
+                "layer": ((node or {}).get("properties") or {}).get("layer"),
+                "role": ((node or {}).get("properties") or {}).get("role"),
+            },
+            "why": [],
+        }
+
+        if selected:
+            if selected.get("semantic_score") is not None:
+                explanation["why"].append("semantic_similarity")
+            if selected.get("keyword_score"):
+                explanation["why"].append("keyword_match")
+            if selected.get("related_context"):
+                explanation["why"].append("graph_related_context")
+            if selected.get("version_context"):
+                explanation["why"].append("version_context")
+        if node:
+            props = node.get("properties") or {}
+            if node.get("label") == "core_memory" or props.get("layer") == "core_memory":
+                explanation["why"].append("core_memory_priority")
+            if node.get("importance", 0) >= 0.8:
+                explanation["why"].append("high_importance")
+
+        return explanation
+
+    def mark_memory_wrong(
+        self,
+        node_id: str,
+        reason: str = "",
+        agent_id: str = None,
+        session_key: str = None,
+    ) -> Dict[str, Any]:
+        """Mark a memory as wrong/suppressed without deleting it."""
+        node = self.get_node(node_id)
+        if not node:
+            return {"status": "not_found", "node_id": node_id}
+        props = dict(node.get("properties") or {})
+        old_importance = float(node.get("importance") or props.get("importance") or 0.5)
+        new_importance = max(old_importance - 0.25, 0.05)
+        props.update({
+            "status": "suppressed",
+            "suppressed": True,
+            "wrong_reason": reason,
+            "marked_wrong_by": agent_id,
+            "marked_wrong_session_key": session_key,
+            "importance": new_importance,
+        })
+        self.update_node(node_id, props)
+        return {
+            "status": "ok",
+            "node_id": node_id,
+            "old_importance": old_importance,
+            "new_importance": new_importance,
+            "reason": reason,
+        }
+
+    def mark_memory_important(
+        self,
+        node_id: str,
+        reason: str = "",
+        agent_id: str = None,
+        session_key: str = None,
+    ) -> Dict[str, Any]:
+        """Raise a memory's importance and mark it as user/agent endorsed."""
+        node = self.get_node(node_id)
+        if not node:
+            return {"status": "not_found", "node_id": node_id}
+        props = dict(node.get("properties") or {})
+        old_importance = float(node.get("importance") or props.get("importance") or 0.5)
+        new_importance = min(max(old_importance + 0.2, 0.8), 1.0)
+        props.update({
+            "important": True,
+            "important_reason": reason,
+            "marked_important_by": agent_id,
+            "marked_important_session_key": session_key,
+            "importance": new_importance,
+        })
+        self.update_node(node_id, props)
+        return {
+            "status": "ok",
+            "node_id": node_id,
+            "old_importance": old_importance,
+            "new_importance": new_importance,
+            "reason": reason,
+        }
+
+    def suppress_pattern(
+        self,
+        pattern: str,
+        reason: str = "",
+        agent_id: str = None,
+        ttl_days: int = None,
+    ) -> Dict[str, Any]:
+        """Store a suppression pattern for capture/retrieval governance."""
+        digest = __import__("hashlib").sha1(pattern.encode("utf-8")).hexdigest()[:12]
+        node_id = f"suppression_pattern:{digest}"
+        properties = {
+            "layer": "governance",
+            "kind": "suppression_pattern",
+            "pattern": pattern,
+            "reason": reason,
+            "agent_id": agent_id,
+            "source_agent_id": agent_id,
+            "source": "agent_feedback",
+            "importance": 0.7,
+            "ttl_days": ttl_days,
+            "memory_scope": "system",
+        }
+        self.add_node(node_id, "suppression_pattern", properties, embedding=None)
+        return {"status": "ok", "node_id": node_id, "pattern": pattern, "reason": reason}
+
+    def get_suppression_patterns(self) -> List[str]:
+        """Return active suppression patterns for capture governance."""
+        cur = self._conn.execute(
+            """
+            SELECT properties
+              FROM nodes
+             WHERE status = 'active'
+               AND label = 'suppression_pattern'
+               AND (ttl_days IS NULL OR datetime(created_at, '+' || ttl_days || ' days') >= CURRENT_TIMESTAMP)
+            """
+        )
+        patterns = []
+        for row in cur.fetchall():
+            props = json.loads(row["properties"] or "{}")
+            pattern = props.get("pattern")
+            if pattern:
+                patterns.append(str(pattern))
+        return patterns
 
     def consolidate(self, semantic_dedup: bool = True, purge_deleted: bool = False) -> Dict[str, int]:
         """Run all consolidation steps including optional semantic dedup.

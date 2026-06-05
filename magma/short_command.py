@@ -1,9 +1,9 @@
 """Short command detection and resolution for MAGMA.
 
-Short confirmations such as "更新", "继续", "开始", "可以", "1", or
-"ok" are not meaningful semantic queries by themselves. MAGMA resolves them
-against the most recent scoped conversation context, preferring explicit L1
-decisions, assistant questions, and fact:action nodes.
+Short confirmations such as "更新", "继续", "开始", "可以", "1", or "ok"
+are not meaningful semantic queries by themselves. MAGMA resolves them against
+the most recent scoped conversation context, preferring explicit L1 decisions,
+assistant questions, and fact:action nodes.
 """
 
 import logging
@@ -108,7 +108,7 @@ QUESTION_INDICATORS = (
 )
 
 QUESTION_ACTION_RE = re.compile(
-    r"(?:需要我|要我|帮你|是否)(.*?)(?:吗|么|\?|\？|$)"
+    r"(?:需要我|要我|帮你|是否)(.*?)(?:吗|么|\?|？|$)"
 )
 
 

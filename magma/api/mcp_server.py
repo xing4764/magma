@@ -54,7 +54,7 @@ async def list_tools() -> List[Tool]:
     #                   feedback, delete_node, update_node, consolidate,
     #                   doctor, stats, search_by_entity
     # Extension tools (P0-3): memory_edit, memory_forget, core_memory_get/set, timeline
-    # Extension tools (P1): entity_add, entity_remove, entity_list
+    # Extension tools (P1): entity_add, entity_remove, entity_list, explain/mark tools
     return [
         Tool(
             name="magma_query",
@@ -134,6 +134,60 @@ async def list_tools() -> List[Tool]:
                     "query": {"type": "string", "description": "Original query (optional)"},
                 },
                 "required": ["event_id", "recalled", "used"],
+            },
+        ),
+        Tool(
+            name="magma_explain_recall",
+            description="Explain why a memory was recalled, including score signals, provenance, and related context.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "event_id": {"type": "string", "description": "Recall event ID to explain (optional)"},
+                    "node_id": {"type": "string", "description": "Specific recalled node ID to explain (optional)"},
+                    "query": {"type": "string", "description": "Original query, useful when event_id is unavailable (optional)"},
+                },
+            },
+        ),
+        Tool(
+            name="magma_mark_wrong",
+            description="Mark a recalled memory as wrong or misleading. The memory is suppressed and down-weighted, not hard-deleted.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node_id": {"type": "string", "description": "Memory node ID to mark wrong"},
+                    "reason": {"type": "string", "description": "Why this memory is wrong or misleading"},
+                    "agent_id": {"type": "string", "description": "Agent applying the correction (optional)"},
+                    "session_key": {"type": "string", "description": "Session where the correction happened (optional)"},
+                },
+                "required": ["node_id"],
+            },
+        ),
+        Tool(
+            name="magma_mark_important",
+            description="Mark a memory as important so future recall ranks it higher.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node_id": {"type": "string", "description": "Memory node ID to promote"},
+                    "reason": {"type": "string", "description": "Why this memory is important"},
+                    "agent_id": {"type": "string", "description": "Agent applying the mark (optional)"},
+                    "session_key": {"type": "string", "description": "Session where the mark happened (optional)"},
+                },
+                "required": ["node_id"],
+            },
+        ),
+        Tool(
+            name="magma_suppress_pattern",
+            description="Add a governance suppression pattern for recurring noise such as diagnostics, rate-limit fragments, or temporary tests.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "pattern": {"type": "string", "description": "Literal or regex-like pattern to suppress"},
+                    "reason": {"type": "string", "description": "Why this pattern should be suppressed"},
+                    "agent_id": {"type": "string", "description": "Agent adding the pattern (optional)"},
+                    "ttl_days": {"type": "integer", "description": "Optional time-to-live in days"},
+                },
+                "required": ["pattern"],
             },
         ),
         Tool(
@@ -307,6 +361,14 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> List[TextContent]:
             return await _handle_get_node(arguments)
         elif name == "magma_feedback":
             return await _handle_feedback(arguments)
+        elif name == "magma_explain_recall":
+            return await _handle_explain_recall(arguments)
+        elif name == "magma_mark_wrong":
+            return await _handle_mark_wrong(arguments)
+        elif name == "magma_mark_important":
+            return await _handle_mark_important(arguments)
+        elif name == "magma_suppress_pattern":
+            return await _handle_suppress_pattern(arguments)
         elif name == "magma_delete_node":
             return await _handle_delete_node(arguments)
         elif name == "magma_update_node":
@@ -418,6 +480,49 @@ async def _handle_feedback(args: Dict[str, Any]) -> List[TextContent]:
         "recalled": args.get("recalled", []),
         "used": args.get("used", []),
         "query": args.get("query", ""),
+    })
+    return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
+
+
+async def _handle_explain_recall(args: Dict[str, Any]) -> List[TextContent]:
+    """Proxy to POST /api/v1/recall/explain."""
+    result = _api_request("POST", "/api/v1/recall/explain", {
+        "event_id": args.get("event_id"),
+        "node_id": args.get("node_id"),
+        "query": args.get("query"),
+    })
+    return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
+
+
+async def _handle_mark_wrong(args: Dict[str, Any]) -> List[TextContent]:
+    """Proxy to POST /api/v1/memory/mark_wrong."""
+    result = _api_request("POST", "/api/v1/memory/mark_wrong", {
+        "node_id": args["node_id"],
+        "reason": args.get("reason", ""),
+        "agent_id": args.get("agent_id"),
+        "session_key": args.get("session_key"),
+    })
+    return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
+
+
+async def _handle_mark_important(args: Dict[str, Any]) -> List[TextContent]:
+    """Proxy to POST /api/v1/memory/mark_important."""
+    result = _api_request("POST", "/api/v1/memory/mark_important", {
+        "node_id": args["node_id"],
+        "reason": args.get("reason", ""),
+        "agent_id": args.get("agent_id"),
+        "session_key": args.get("session_key"),
+    })
+    return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
+
+
+async def _handle_suppress_pattern(args: Dict[str, Any]) -> List[TextContent]:
+    """Proxy to POST /api/v1/memory/suppress_pattern."""
+    result = _api_request("POST", "/api/v1/memory/suppress_pattern", {
+        "pattern": args["pattern"],
+        "reason": args.get("reason", ""),
+        "agent_id": args.get("agent_id"),
+        "ttl_days": args.get("ttl_days"),
     })
     return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
 

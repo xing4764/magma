@@ -172,6 +172,26 @@ class FeedbackRequest(BaseModel):
     unused_delta: float = -0.01
 
 
+class ExplainRecallRequest(BaseModel):
+    query: Optional[str] = None
+    event_id: Optional[str] = None
+    node_id: Optional[str] = None
+
+
+class MarkMemoryRequest(BaseModel):
+    node_id: str
+    reason: str = ""
+    agent_id: Optional[str] = None
+    session_key: Optional[str] = None
+
+
+class SuppressPatternRequest(BaseModel):
+    pattern: str
+    reason: str = ""
+    agent_id: Optional[str] = None
+    ttl_days: Optional[int] = None
+
+
 def create_app() -> FastAPI:
     """Create and configure the FastAPI application."""
 
@@ -355,10 +375,28 @@ def create_app() -> FastAPI:
     async def capture(req: CaptureRequest):
         from magma.graph.sqlite_store import get_store
         from magma.vector.encoder import Encoder
+        from magma.capture_policy import classify_capture
 
         store = getattr(app.state, "store", None) or get_store()
         encoder = getattr(app.state, "encoder", None) or Encoder()
         written = []
+
+        capture_decision = await asyncio.to_thread(
+            classify_capture,
+            req.user_text,
+            req.assistant_text,
+            await asyncio.to_thread(store.get_suppression_patterns),
+        )
+        if not capture_decision.should_capture:
+            return {
+                "status": "skipped",
+                "written": [],
+                "count": 0,
+                "capture_decision": {
+                    "strength": capture_decision.strength,
+                    "reasons": capture_decision.reasons,
+                },
+            }
 
         for role, text in (("user", req.user_text), ("assistant", req.assistant_text)):
             cleaned = (text or "").strip()
@@ -386,6 +424,8 @@ def create_app() -> FastAPI:
                 "importance": _capture_importance(role, cleaned),
                 "source_agent_id": _parse_source_agent(req.session_key) or req.agent_id,
                 "department": DEPT_MAP.get(_parse_source_agent(req.session_key) or req.agent_id or "", ""),
+                "capture_strength": capture_decision.strength,
+                "capture_reasons": capture_decision.reasons,
             }
             properties.update(await asyncio.to_thread(_memory_metadata, cleaned))
             text_for_embedding = f"{role}: {cleaned}"
@@ -418,7 +458,15 @@ def create_app() -> FastAPI:
                 req, written, encoder, store, faiss_index, extract_facts_fn
             ))
 
-        return {"status": "ok", "written": written, "count": len(written)}
+        return {
+            "status": "ok",
+            "written": written,
+            "count": len(written),
+            "capture_decision": {
+                "strength": capture_decision.strength,
+                "reasons": capture_decision.reasons,
+            },
+        }
 
     async def _extract_facts_background(req, written, encoder, store, faiss_index, extract_facts_fn):
         """Background task: extract facts + causal relations without blocking capture response."""
@@ -787,6 +835,66 @@ def create_app() -> FastAPI:
             department=dept,
         )
         return {"status": "ok", "feedback": stats}
+
+    @app.post("/api/v1/recall/explain")
+    async def explain_recall(req: ExplainRecallRequest):
+        from magma.graph.sqlite_store import get_store
+
+        store = getattr(app.state, "store", None) or get_store()
+        return {
+            "status": "ok",
+            "explanation": await asyncio.to_thread(
+                store.explain_recall,
+                query=req.query,
+                event_id=req.event_id,
+                node_id=req.node_id,
+            ),
+        }
+
+    @app.post("/api/v1/memory/mark_wrong")
+    async def mark_wrong(req: MarkMemoryRequest):
+        from magma.graph.sqlite_store import get_store
+
+        store = getattr(app.state, "store", None) or get_store()
+        result = await asyncio.to_thread(
+            store.mark_memory_wrong,
+            node_id=req.node_id,
+            reason=req.reason,
+            agent_id=req.agent_id,
+            session_key=req.session_key,
+        )
+        if result.get("status") == "not_found":
+            raise HTTPException(status_code=404, detail=f"Node {req.node_id} not found")
+        return result
+
+    @app.post("/api/v1/memory/mark_important")
+    async def mark_important(req: MarkMemoryRequest):
+        from magma.graph.sqlite_store import get_store
+
+        store = getattr(app.state, "store", None) or get_store()
+        result = await asyncio.to_thread(
+            store.mark_memory_important,
+            node_id=req.node_id,
+            reason=req.reason,
+            agent_id=req.agent_id,
+            session_key=req.session_key,
+        )
+        if result.get("status") == "not_found":
+            raise HTTPException(status_code=404, detail=f"Node {req.node_id} not found")
+        return result
+
+    @app.post("/api/v1/memory/suppress_pattern")
+    async def suppress_pattern(req: SuppressPatternRequest):
+        from magma.graph.sqlite_store import get_store
+
+        store = getattr(app.state, "store", None) or get_store()
+        return await asyncio.to_thread(
+            store.suppress_pattern,
+            pattern=req.pattern,
+            reason=req.reason,
+            agent_id=req.agent_id,
+            ttl_days=req.ttl_days,
+        )
 
     return app
 
