@@ -7,10 +7,21 @@ This runbook is the first stop for MAGMA health checks and safe self-service tri
 Run these commands from any PowerShell session:
 
 ```powershell
+python C:\openclaw-magma\scripts\magma_acceptance.py --skip-benchmark
 python C:\openclaw-magma\scripts\magma_ops.py status
 python C:\openclaw-magma\scripts\magma_doctor.py --json
 python C:\openclaw-magma\scripts\magma_doctor.py --agent
 ```
+
+Use the full acceptance gate after code changes or model/index work:
+
+```powershell
+python C:\openclaw-magma\scripts\magma_acceptance.py
+```
+
+The acceptance gate checks API health, doctor, Python syntax for core modules,
+recall eval, product benchmark, and L1 dry-run reachability. A `GREEN` result is
+the normal release/hand-off condition.
 
 ## Status Meaning
 
@@ -85,23 +96,27 @@ The realtime recall path must stay fast because it runs before prompt build:
 - Use `scripts/qwen_embedding_probe.py` and `scripts/qwen_reranker_probe.py` for offline A/B tests only.
 - Do not enable Qwen3 reranking in the realtime `before_prompt_build` path on CPU-only 12GB hosts; top20 reranking can take tens of seconds.
 
-## L1 Distillation Cron
+## L1 Distillation
 
-A Windows scheduled task `MAGMA-L1-Distill` runs `magma_l1_distill.py` every 65 minutes:
+L1 is the stable memory layer for decisions, preferences, project state,
+pending actions, lessons, and concrete facts. It is intentionally stricter than
+L0 capture: transient debug output, acknowledgements, diagnostic reports, and
+assistant self-corrections should stay in L0 only.
+
+Run L1 in dry-run mode first:
 
 ```powershell
-# Verify task status
-Get-ScheduledTask -TaskName "MAGMA-L1-Distill"
-Get-ScheduledTaskInfo -TaskName "MAGMA-L1-Distill"
-
-# Manual trigger
-Start-ScheduledTask -TaskName "MAGMA-L1-Distill"
-
-# Run script directly (for debugging)
-python C:\openclaw-magma\scripts\magma_l1_distill.py --hours 4 --verbose
+python C:\openclaw-magma\scripts\magma_l1_runner.py --hours 24 --limit 200 --json
 ```
 
-The script looks back 4 hours per run (overlapping windows are safe due to upsert logic).
+Apply only when the preview looks clean:
+
+```powershell
+python C:\openclaw-magma\scripts\magma_l1_runner.py --hours 24 --limit 200 --apply
+```
+
+For scoped testing, use `--source-agent-id benchmark` or another source agent.
+Overlapping windows are safe because L1 node IDs are stable upserts.
 
 ### L1 Recall Weighting
 

@@ -1,4 +1,9 @@
-"""Deterministic L1 distillation for high-value MAGMA memories."""
+"""Deterministic L1 distillation for high-value MAGMA memories.
+
+L1 is the stable memory layer. It should contain decisions, preferences,
+project state, lessons, pending actions, and concrete facts. It must not absorb
+diagnostic fragments, acknowledgements, or transient debug chatter.
+"""
 
 from __future__ import annotations
 
@@ -6,7 +11,7 @@ import hashlib
 import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Optional
 
 from magma.capture_policy import classify_capture
 
@@ -22,22 +27,22 @@ KIND_IMPORTANCE = {
 
 KIND_PATTERNS = {
     "preference": (
-        r"老板偏好|长期要求|以后.*优先|不要.*花哨|必须.*真实可用|产品化",
+        r"老板偏好|长期要求|以后.*优先|不要.*花哨|必须.*真实可用|产品化|要的是.*更强大|不追求.*开源",
     ),
     "decision": (
-        r"决定|确认|最终方案|采用|改成|切到|回退|上线|默认|不允许|不能|不要擅自",
+        r"决定|确认|最终方案|采用|改成|切到|回退|上线|默认|不允许|不能|不要擅自|给你权限|正式|已切换",
     ),
     "project_state": (
-        r"已完成|已上线|已推送|已修复|已重启|当前状态|现在是|测试通过|验收通过|GREEN|通过",
+        r"已完成|已上线|已推送|已修复|已重启|已经.*(装好|集成|完成|上线)|当前状态|现在是|测试通过|验收通过|GREEN|通过|生产可用",
     ),
     "pending_action": (
-        r"下一步|待办|需要继续|准备做|开始做|要做的是|优先做|还需要",
+        r"下一步|待办|需要继续|准备做|开始做|要做的是|优先做|还需要|需要我.*吗|要不要.*",
     ),
     "lesson": (
-        r"教训|根因|原因是|问题在于|不要再|下次.*先|踩坑",
+        r"教训|根因|原因是|问题在于|不要再|下次.*先|跑偏|卡住|限流|超时|失败",
     ),
     "fact": (
-        r"MAGMA|OpenClaw|Gateway|MCP|Core Memory|core_memory|embedding|reranker|SQLite|FAISS|API|端口|版本|SKU|尺码",
+        r"MAGMA|OpenClaw|Gateway|MCP|Core Memory|core_memory|embedding|reranker|SQLite|FAISS|API|端口|版本|SKU|尺码|抖店|上架|agentmemory|MoneyPrinterTurbo|CloakBrowser",
     ),
 }
 
@@ -48,6 +53,54 @@ NOISE_MARKERS = (
     "分析完了",
     "说实话",
     "我的意思就是",
+    "你的意思是",
+    "不是让我",
+    "不是打了个逗号吗",
+    "后面我不是打了个逗号吗",
+    "验收结果",
+    "检查项",
+    "测试结果",
+    "API 层",
+    "short_command 字段",
+    "诊断报告",
+    "debug",
+    "调试",
+    "[Inter-session message]",
+)
+
+LOW_VALUE_PATTERNS = (
+    r"^(收到|好的|好|嗯|可以|明白|了解|ok|done)[。！!,.，\s✅]*$",
+    r"^对[，,。]?(我)?读错了[。！!,.，\s]*$",
+    r"^已记录\s*[✅。！!,.，\s]*$",
+    r"^全部字段\s*[✅。！!,.，\s]*(验收通过)?[。！!,.，\s]*$",
+)
+
+SUBSTANCE_TERMS = (
+    "MAGMA",
+    "OpenClaw",
+    "Gateway",
+    "MCP",
+    "Core Memory",
+    "embedding",
+    "reranker",
+    "SQLite",
+    "FAISS",
+    "API",
+    "端口",
+    "版本",
+    "SKU",
+    "尺码",
+    "抖店",
+    "上架",
+    "公开仓库",
+    "README",
+    "agentmemory",
+    "MoneyPrinterTurbo",
+    "CloakBrowser",
+    "doctor",
+    "benchmark",
+    "recall",
+    "L1",
 )
 
 
@@ -83,7 +136,19 @@ def _is_noise(text: str) -> bool:
         return True
     if any(marker in text for marker in NOISE_MARKERS):
         return True
+    if any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in LOW_VALUE_PATTERNS):
+        return True
     return classify_capture(text, "").should_capture is False
+
+
+def _has_substance(text: str, kind: str) -> bool:
+    if any(term.lower() in text.lower() for term in SUBSTANCE_TERMS):
+        return True
+    if kind in {"preference", "decision", "pending_action", "lesson"} and len(text) >= 28:
+        return True
+    if kind == "project_state" and len(text) >= 32:
+        return True
+    return False
 
 
 def classify_l1_kind(text: str) -> Optional[str]:
@@ -95,7 +160,7 @@ def classify_l1_kind(text: str) -> Optional[str]:
 
 
 def _title(text: str) -> str:
-    first = re.split(r"[。！？.!?]\s*", text, maxsplit=1)[0].strip()
+    first = re.split(r"[。！？?!]\s*", text, maxsplit=1)[0].strip()
     return first[:60] if first else text[:60]
 
 
@@ -106,12 +171,20 @@ def build_l1_candidate(node: Dict[str, Any]) -> Optional[L1Candidate]:
         return None
 
     text = _normalize(_content(node))
+    role = str(props.get("role") or "").lower()
+    if role == "assistant" and re.match(r"^(收到|好的|明白|对[，,。]?(我)?读错了)", text, flags=re.IGNORECASE):
+        return None
     if _is_noise(text):
         return None
 
     kind = classify_l1_kind(text)
-    if not kind:
+    if not kind or not _has_substance(text, kind):
         return None
+    if kind == "fact":
+        if role == "user" and re.search(r"(吗|么|什么|为什么|怎么|如何|是不是|能不能)[？?]?$", text):
+            return None
+        if role == "fact" and len(text) < 24:
+            return None
 
     source_agent = node.get("source_agent_id") or props.get("source_agent_id") or props.get("agent_id") or ""
     department = node.get("department") or props.get("department") or ""

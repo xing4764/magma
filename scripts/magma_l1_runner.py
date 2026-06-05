@@ -13,6 +13,10 @@ import sys
 import urllib.request
 from pathlib import Path
 
+if sys.platform == "win32":
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 
 def configured_api_base() -> str:
     env_base = os.environ.get("MAGMA_API_BASE")
