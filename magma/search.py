@@ -883,7 +883,7 @@ class MemorySearcher:
                 recent_nodes = self.store.get_recent_conversation(
                     agent_id=agent_id,
                     session_key=session_key,
-                    limit=10,
+                    limit=50,
                     hours=24,
                 )
                 # Also check L1 decision nodes (highest priority)
@@ -1380,8 +1380,9 @@ class MemorySearcher:
                     item["score_breakdown"]["causal_boost"] = round(causal_boost, 4)
 
         # --- Short Command Anti-Drift Check ---
-        # If short command was resolved but top results don't match context,
-        # add a warning flag for the caller
+        # If short command was resolved, the resolved context is the user's
+        # real intent anchor. Force it into the final result set even when the
+        # semantic/graph ranks miss it.
         if short_cmd_resolution and short_cmd_boost_ids:
             top_result_ids = {item["id"] for item in results[:top_k]}
             context_in_top = any(nid in top_result_ids for nid in short_cmd_boost_ids)
@@ -1390,12 +1391,52 @@ class MemorySearcher:
                     f"Short command anti-drift: resolved context nodes not in top-{top_k} results. "
                     f"Context: {short_cmd_boost_ids}, Top: {[r['id'] for r in results[:top_k]]}"
                 )
-                # Inject a warning into the first result
-                if results:
-                    results[0]["short_command_drift_warning"] = True
-                    results[0]["short_command_resolution"] = build_short_command_response(
-                        short_cmd_resolution
-                    )
+            existing = {item["id"]: item for item in results}
+            max_score = max((float(item.get("score", 0.0) or 0.0) for item in results), default=1.0)
+            forced_score = round(max_score + 1.0, 6)
+            for idx, nid in enumerate(short_cmd_boost_ids):
+                item = existing.get(nid)
+                if item is None:
+                    item = self.store.get_node(nid)
+                    if not item or item.get("status") == "deleted":
+                        continue
+                    provenance = _provenance(item)
+                    item["semantic_score"] = 0.0
+                    item["keyword_score"] = 0.0
+                    item["lifecycle_multiplier"] = round(float(_lifecycle_multiplier(item)), 6)
+                    item["agent_scope_multiplier"] = round(float(_agent_scope_multiplier(item, filters)), 6)
+                    item["intent_multiplier"] = round(float(_intent_multiplier(item, intent)), 6)
+                    item["entity_overlap_multiplier"] = 1.0
+                    item["memory_quality_multiplier"] = round(float(_memory_quality_multiplier(item)), 6)
+                    item["operational_authority_multiplier"] = 1.0
+                    item["recency_boost"] = 1.0
+                    item["age_hours"] = round(float(_node_age_hours(item)), 2) if _node_age_hours(item) is not None else None
+                    item["recency_query"] = recency_query
+                    item["query_entities"] = query_entities
+                    item["query_scope"] = query_scope
+                    item["query_intent"] = intent
+                    item["memory_scope"] = _memory_scope(item)
+                    item["retrieval_source"] = "short_command_context"
+                    item["provenance"] = provenance
+                    item["source_agent_id"] = provenance.get("agent_id")
+                    item["memory_source"] = provenance.get("source")
+                    item["source_session_key"] = provenance.get("session_key")
+                    results.append(item)
+                    existing[nid] = item
+                item["score"] = round(forced_score - idx * 0.001, 6)
+                item["score_breakdown"] = item.get("score_breakdown") or {}
+                item["score_breakdown"]["short_cmd_forced"] = True
+                item["short_command_resolved"] = True
+                item["resolution_source"] = short_cmd_resolution["pending_action"]["source"]
+
+            results.sort(key=lambda item: item["score"], reverse=True)
+            if results:
+                final_top_ids = {item["id"] for item in results[:top_k]}
+                final_context_in_top = any(nid in final_top_ids for nid in short_cmd_boost_ids)
+                results[0]["short_command_drift_warning"] = not final_context_in_top
+                results[0]["short_command_resolution"] = build_short_command_response(
+                    short_cmd_resolution
+                )
 
         self.store.touch_nodes([item["id"] for item in results])
         return results

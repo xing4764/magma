@@ -38,6 +38,34 @@ _COMPILED_PATTERNS = [re.compile(p, re.IGNORECASE) for p in SHORT_COMMAND_PATTER
 MAX_SHORT_COMMAND_LENGTH = 6
 
 
+def normalize_short_command_query(query: str) -> str:
+    """Strip OpenClaw runtime wrappers before short-command detection."""
+    if not query:
+        return ""
+
+    q = str(query).strip()
+    if not q:
+        return ""
+
+    lines = [line.strip() for line in q.splitlines() if line.strip()]
+
+    # OpenClaw may prepend recovery notes before the actual user message.
+    while lines and lines[0].startswith("Note:"):
+        lines.pop(0)
+    if not lines:
+        return ""
+
+    q = lines[0]
+
+    # OpenClaw prompt text commonly arrives as:
+    # [Fri 2026-06-05 19:53 GMT+8] 更新
+    m = re.match(r"^\[[^\]]+\]\s*(.+)$", q)
+    if m:
+        q = m.group(1).strip()
+
+    return q
+
+
 def is_short_command(query: str) -> bool:
     """Detect if a query is a short command that needs context resolution.
 
@@ -49,7 +77,7 @@ def is_short_command(query: str) -> bool:
     if not query or not query.strip():
         return False
 
-    q = query.strip()
+    q = normalize_short_command_query(query)
 
     # Too long to be a short command
     if len(q) > MAX_SHORT_COMMAND_LENGTH:
@@ -76,8 +104,10 @@ def extract_pending_action(recent_nodes: List[Dict[str, Any]]) -> Optional[Dict[
     if not recent_nodes:
         return None
 
+    newest_first = list(reversed(recent_nodes))
+
     # Priority 1: L1 decision/task_intent nodes (most reliable)
-    for node in recent_nodes:
+    for node in newest_first:
         props = node.get("properties") or {}
         layer = props.get("layer")
         kind = props.get("kind")
@@ -90,7 +120,7 @@ def extract_pending_action(recent_nodes: List[Dict[str, Any]]) -> Optional[Dict[
             }
 
     # Priority 2: Assistant messages with questions (pending question)
-    for node in recent_nodes:
+    for node in newest_first:
         props = node.get("properties") or {}
         role = props.get("role")
         content = str(props.get("content") or props.get("message") or "")
@@ -112,11 +142,20 @@ def extract_pending_action(recent_nodes: List[Dict[str, Any]]) -> Optional[Dict[
                 }
 
     # Priority 3: Recent L0 events mentioning pending actions
-    for node in recent_nodes[:3]:  # Only check most recent 3
+    for node in newest_first[:6]:  # Only check the freshest context
         props = node.get("properties") or {}
         content = str(props.get("content") or props.get("message") or "")
         layer = props.get("layer")
+        role = props.get("role")
+        node_id = str(node.get("id") or "")
         if layer == "L0" and content:
+            if role == "fact" and node_id.startswith("fact:action:"):
+                return {
+                    "node": node,
+                    "source": "fact_action",
+                    "confidence": 0.75,
+                    "action_hint": content[:100],
+                }
             # Check if the content suggests a pending action
             pending_keywords = ("需要", "准备", "打算", "计划", "待", "pending", "todo")
             if any(kw in content.lower() for kw in pending_keywords):
@@ -126,6 +165,178 @@ def extract_pending_action(recent_nodes: List[Dict[str, Any]]) -> Optional[Dict[
                     "confidence": 0.6,
                     "action_hint": content[:100],
                 }
+
+    return None
+
+
+def extract_pending_action(recent_nodes: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Extract a pending action while ignoring diagnostic graph fragments.
+
+    The fallback must not bind to fact/cause/effect troubleshooting notes just
+    because they contain words like "pending" or "need". Short confirmations
+    should bind to the latest real assistant question or explicit fact:action.
+    """
+    if not recent_nodes:
+        return None
+
+    newest_first = list(reversed(recent_nodes))
+
+    for node in newest_first:
+        props = node.get("properties") or {}
+        if props.get("layer") == "L1" and props.get("kind") in ("decision", "task_intent"):
+            return {
+                "node": node,
+                "source": "l1_decision",
+                "confidence": 0.95,
+                "action_hint": props.get("content") or props.get("summary") or "",
+            }
+
+    event_nodes = [
+        node for node in newest_first
+        if node.get("label") == "event"
+        and (node.get("properties") or {}).get("role") in ("assistant", "user")
+    ]
+
+    question_indicators = (
+        "\u9700\u8981\u6211", "\u8981\u6211", "\u8981\u4e0d", "\u662f\u5426",
+        "\u4f60\u60f3", "\u4f60\u8981", "\u5e2e\u4f60", "\u5417\uff1f", "\u5417",
+        "?", "\uff1f",
+        "闇€瑕佹垜", "瑕佹垜", "瑕佷笉", "鏄惁", "浣犳兂", "浣犺", "甯綘", "鍚楋紵", "鍚?",
+    )
+    question_re = re.compile(
+        r"(?:\u9700\u8981\u6211|\u8981\u6211|\u5e2e\u4f60|\u662f\u5426|"
+        r"闇€瑕佹垜|瑕佹垜|甯綘|鏄惁)(.*?)(?:\u5417|\u55ce|\u4e48|\u9ebc|\?|\uff1f|鍚梶鍚\?|锛焲$)"
+    )
+    for node in event_nodes:
+        props = node.get("properties") or {}
+        content = str(props.get("content") or props.get("message") or "")
+        if props.get("role") == "assistant" and content and any(ind in content for ind in question_indicators):
+            match = question_re.search(content)
+            return {
+                "node": node,
+                "source": "assistant_question",
+                "confidence": 0.85,
+                "action_hint": match.group(1).strip() if match else content[:100],
+            }
+
+    for node in newest_first:
+        props = node.get("properties") or {}
+        content = str(props.get("content") or props.get("message") or "")
+        node_id = str(node.get("id") or "")
+        if props.get("layer") == "L0" and props.get("role") == "fact" and node_id.startswith("fact:action:"):
+            return {
+                "node": node,
+                "source": "fact_action",
+                "confidence": 0.75,
+                "action_hint": content[:100],
+            }
+
+    pending_keywords = (
+        "\u9700\u8981", "\u51c6\u5907", "\u6253\u7b97", "\u8ba1\u5212", "\u5f85",
+        "pending", "todo",
+    )
+    for node in event_nodes[:10]:
+        props = node.get("properties") or {}
+        content = str(props.get("content") or props.get("message") or "")
+        if props.get("layer") == "L0" and content and any(kw in content.lower() for kw in pending_keywords):
+            return {
+                "node": node,
+                "source": "l0_pending",
+                "confidence": 0.6,
+                "action_hint": content[:100],
+            }
+
+    return None
+
+
+def extract_pending_action(recent_nodes: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Strict pending-action resolver for short confirmations."""
+    if not recent_nodes:
+        return None
+
+    newest_first = list(reversed(recent_nodes))
+    diagnostic_markers = (
+        "\u9a8c\u6536\u7ed3\u679c", "\u68c0\u67e5\u9879", "\u6839\u56e0",
+        "\u7ed3\u8bba", "\u53d1\u73b0\u95ee\u9898", "\u95ee\u9898\u94fe",
+        "short_command", "extract_pending_action", "drift_warning",
+        "magma-recall.jsonl", "API \u8fd4\u56de", "Codex \u5df2",
+    )
+
+    def is_diagnostic(content: str) -> bool:
+        return any(marker in content for marker in diagnostic_markers)
+
+    for node in newest_first:
+        props = node.get("properties") or {}
+        content = str(props.get("content") or props.get("summary") or "")
+        if is_diagnostic(content):
+            continue
+        if props.get("layer") == "L1" and props.get("kind") in ("decision", "task_intent"):
+            return {
+                "node": node,
+                "source": "l1_decision",
+                "confidence": 0.95,
+                "action_hint": content,
+            }
+
+    event_nodes = [
+        node for node in newest_first
+        if node.get("label") == "event"
+        and (node.get("properties") or {}).get("role") in ("assistant", "user")
+    ]
+
+    question_indicators = (
+        "\u9700\u8981\u6211", "\u8981\u6211", "\u8981\u4e0d", "\u662f\u5426",
+        "\u4f60\u60f3", "\u4f60\u8981", "\u5e2e\u4f60", "\u5417\uff1f", "\u5417",
+        "?", "\uff1f",
+    )
+    question_re = re.compile(
+        r"(?:\u9700\u8981\u6211|\u8981\u6211|\u5e2e\u4f60|\u662f\u5426)"
+        r"(.*?)(?:\u5417|\u55ce|\u4e48|\u9ebc|\?|\uff1f|$)"
+    )
+    for node in event_nodes:
+        props = node.get("properties") or {}
+        content = str(props.get("content") or props.get("message") or "")
+        if is_diagnostic(content):
+            continue
+        if props.get("role") == "assistant" and any(ind in content for ind in question_indicators):
+            match = question_re.search(content)
+            return {
+                "node": node,
+                "source": "assistant_question",
+                "confidence": 0.85,
+                "action_hint": match.group(1).strip() if match else content[:100],
+            }
+
+    for node in newest_first:
+        props = node.get("properties") or {}
+        content = str(props.get("content") or props.get("message") or "")
+        node_id = str(node.get("id") or "")
+        if is_diagnostic(content):
+            continue
+        if props.get("layer") == "L0" and props.get("role") == "fact" and node_id.startswith("fact:action:"):
+            return {
+                "node": node,
+                "source": "fact_action",
+                "confidence": 0.75,
+                "action_hint": content[:100],
+            }
+
+    pending_keywords = (
+        "\u9700\u8981", "\u51c6\u5907", "\u6253\u7b97", "\u8ba1\u5212", "\u5f85",
+        "pending", "todo",
+    )
+    for node in event_nodes[:10]:
+        props = node.get("properties") or {}
+        content = str(props.get("content") or props.get("message") or "")
+        if is_diagnostic(content):
+            continue
+        if props.get("layer") == "L0" and any(kw in content.lower() for kw in pending_keywords):
+            return {
+                "node": node,
+                "source": "l0_pending",
+                "confidence": 0.6,
+                "action_hint": content[:100],
+            }
 
     return None
 
@@ -147,16 +358,17 @@ def resolve_short_command(
             "suggested_action": str,  # What action should be taken
         }
     """
-    if not is_short_command(query):
+    command = normalize_short_command_query(query)
+    if not is_short_command(command):
         return None
 
     pending = extract_pending_action(recent_nodes)
     if not pending:
-        logger.info(f"Short command '{query}' detected but no pending action found in recent context")
+        logger.info(f"Short command '{command}' detected but no pending action found in recent context")
         return None
 
     # Determine if the short command is a confirmation or rejection
-    q = query.strip().lower()
+    q = command.strip().lower()
     confirmation_words = {
         "好", "行", "可以", "没问题", "ok", "yes", "确认", "确定", "对", "嗯",
         "搞吧", "弄吧", "上", "干吧", "整", "好的", "行的", "可以的",
@@ -198,7 +410,8 @@ def resolve_short_command(
         "context_nodes": context_nodes,
         "confidence": pending["confidence"],
         "suggested_action": pending["action_hint"] if is_confirm else None,
-        "query": query,
+        "query": command,
+        "raw_query": query,
     }
 
 
