@@ -351,7 +351,17 @@ async def _handle_query(args: Dict[str, Any]) -> List[TextContent]:
     results = result.get("results", result)
     if not results:
         results = [{"info": f"No results for '{args['query']}'."}]
-    return [TextContent(type="text", text=json.dumps(results, ensure_ascii=False, indent=2))]
+    # P2: Include narrative and references in MCP output
+    output = {
+        "results": results,
+        "narrative": result.get("narrative"),
+        "references": result.get("references"),
+        "token_budget": result.get("token_budget"),
+        "tokens_used": result.get("tokens_used"),
+        "count": result.get("count", len(results)),
+        "intent": result.get("intent"),
+    }
+    return [TextContent(type="text", text=json.dumps(output, ensure_ascii=False, indent=2))]
 
 
 async def _handle_add_node(args: Dict[str, Any]) -> List[TextContent]:

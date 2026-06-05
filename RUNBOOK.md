@@ -1,4 +1,4 @@
-# MAGMA Operations Runbook
+﻿# MAGMA Operations Runbook
 
 This runbook is the first stop for MAGMA health checks and safe self-service triage.
 
@@ -109,14 +109,14 @@ L1 nodes receive higher recall weight than L0 in `magma/search.py`:
 
 | Layer / Kind | Quality Multiplier |
 |---|---|
-| L1 · current_state | 1.30 |
-| L1 · decision | 1.25 |
-| L1 · fact | 1.18 |
-| L1 · (unclassified) | 1.20 |
+| L1 路 current_state | 1.30 |
+| L1 路 decision | 1.25 |
+| L1 路 fact | 1.18 |
+| L1 路 (unclassified) | 1.20 |
 | ops_anchor | 1.08 |
-| L0 · user (non-question) | 0.86 |
-| L0 · user (question) | 0.62 |
-| L0 · assistant | 0.98 |
+| L0 路 user (non-question) | 0.86 |
+| L0 路 user (question) | 0.62 |
+| L0 路 assistant | 0.98 |
 
 Combined with operational authority multiplier (up to 1.34x for keyword-matching L1 nodes), L1 current_state nodes can achieve up to ~1.74x total boost over L0 baseline.
 

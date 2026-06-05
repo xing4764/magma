@@ -36,6 +36,107 @@ INTENT_KEYWORDS = {
     ),
 }
 
+# --- P1: Intent-aware routing (arxiv:2601.03236) ---
+_INTENT_PATTERNS = {
+    "why": [
+        r"为什么|原因|导致|因为|为何|怎么回事",
+        r"why|because|reason|root\s*cause|cause\s*of",
+    ],
+    "when": [
+        r"什么时候|何时|上次|时间|日期|几点",
+        r"when|time|date|last\s*time|recent",
+    ],
+    "entity": [
+        r"谁|什么|哪个|哪里|哪一个",
+        r"who|what|which|where",
+    ],
+}
+_INTENT_COMPILED = {intent: [re.compile(p, re.IGNORECASE) for p in patterns]
+                    for intent, patterns in _INTENT_PATTERNS.items()}
+
+# Adaptive weight mapping per intent (论文核心贡献)
+INTENT_WEIGHTS = {
+    "why":     {"w_temporal": 0.5, "w_causal": 5.0, "w_entity": 2.5, "w_semantic": 1.0},
+    "when":    {"w_temporal": 4.0, "w_causal": 1.0, "w_entity": 1.0, "w_semantic": 1.0},
+    "entity":  {"w_temporal": 1.0, "w_causal": 1.0, "w_entity": 6.0, "w_semantic": 2.0},
+    "general": {"w_temporal": 1.0, "w_causal": 1.0, "w_entity": 1.0, "w_semantic": 3.0},
+}
+
+RRF_K = 60  # Reciprocal Rank Fusion constant (论文默认值)
+
+# --- P1: Recency Boost ---
+RECENCY_KEYWORDS = (
+    "最近", "最新", "当前", "现在", "今晚", "刚才", "今天",
+    "升级后", "回退后", "稳定基准", "当前版本",
+    "latest", "recent", "current", "目前",
+)
+
+# Layers that receive strong recency boost
+RECENCY_BOOSTED_LAYERS = {"L1", "fact", "current_state", "summary", "decision", "ops_anchor"}
+# Layers that never receive recency boost
+RECENCY_EXCLUDED_LAYERS = {"debug", "temporary"}
+
+
+
+def _detect_recency_intent(query: str) -> bool:
+    """Detect whether query has recency intent (asking for latest/current info)."""
+    q = (query or "").lower()
+    return any(kw in q for kw in RECENCY_KEYWORDS)
+
+
+def _node_age_hours(node: Dict[str, Any]) -> Optional[float]:
+    """Return node age in hours from created_at, or None if unavailable."""
+    created_at = _parse_time((node.get("properties") or {}).get("created_at"))
+    if not created_at:
+        created_at = _parse_time(node.get("created_at"))
+    if not created_at:
+        return None
+    now = datetime.utcnow()
+    delta = now - created_at
+    return max(delta.total_seconds() / 3600.0, 0.0)
+
+
+def _compute_recency_boost(
+    age_hours: Optional[float],
+    recency_query: bool,
+    layer: Optional[str],
+) -> float:
+    """Compute recency boost multiplier.
+
+    - recency_query=True  → strong boost for fresh nodes
+    - recency_query=False → light boost (non-recency queries still benefit slightly from freshness)
+    - Respects layer allow/exclude lists
+    """
+    if age_hours is None:
+        return 1.0
+    # Excluded layers never get boosted
+    if layer in RECENCY_EXCLUDED_LAYERS:
+        return 1.0
+    # Non-boosted layers only get light boost when recency_query
+    if layer not in RECENCY_BOOSTED_LAYERS:
+        # L0: no strong boost unless query explicitly asks "刚才我说了什么"
+        if layer == "L0":
+            return 1.0
+        # Other unlisted layers: no boost
+        return 1.0
+    if recency_query:
+        if age_hours < 24:
+            return 1.25
+        elif age_hours < 72:
+            return 1.12
+        elif age_hours < 168:
+            return 1.05
+        else:
+            return 1.0
+    else:
+        if age_hours < 24:
+            return 1.06
+        elif age_hours < 72:
+            return 1.03
+        else:
+            return 1.0
+
+
 RELATED_RELATIONS = (
     "same_as",
     "responded_by",
@@ -157,33 +258,78 @@ def _keyword_score(query: str, node: Dict[str, Any], searchable_text: str = None
     return min(score, 1.15)
 
 
-def detect_intent(query: str) -> Dict[str, Any]:
-    query_lower = (query or "").lower()
+def classify_intent(query: str) -> Dict[str, Any]:
+    """P1 Intent Router: classify query into why/when/entity/general.
+
+    Uses regex pattern matching (zero latency, no LLM).
+    Returns intent dict with primary label, scores, and adaptive weights.
+    """
+    query_str = query or ""
     scores = {}
-    for intent, keywords in INTENT_KEYWORDS.items():
-        scores[intent] = sum(1 for keyword in keywords if keyword.lower() in query_lower)
-    primary = max(scores, key=scores.get) if any(scores.values()) else "semantic"
+    for intent, patterns in _INTENT_COMPILED.items():
+        match_count = sum(1 for p in patterns if p.search(query_str))
+        scores[intent] = match_count
+    # general = fallback when no intent signals detected
+    if any(scores.values()):
+        # Disambiguation: when why and entity tie, prefer why if strong causal signal
+        why_causal_keywords = ("\u539f\u56e0", "\u5bfc\u81f4", "\u56e0\u4e3a", "\u4e3a\u4f55", "root cause")
+        if scores.get("why", 0) > 0 and scores.get("entity", 0) > 0:
+            if scores["why"] >= scores["entity"] or any(kw in query_str for kw in why_causal_keywords):
+                primary = "why"
+            else:
+                primary = "entity"
+        else:
+            primary = max(scores, key=scores.get)
+    else:
+        primary = "general"
+    weights = INTENT_WEIGHTS[primary]
     return {
         "primary": primary,
         "scores": scores,
+        "weights": weights,
+    }
+
+
+def detect_intent(query: str) -> Dict[str, Any]:
+    """Backward-compatible wrapper. Returns old format for existing callers."""
+    result = classify_intent(query)
+    # Map new names to old names for backward compat
+    name_map = {"why": "causal", "when": "temporal", "entity": "entity", "general": "semantic"}
+    old_scores = {}
+    for intent, keywords in INTENT_KEYWORDS.items():
+        query_lower = (query or "").lower()
+        old_scores[intent] = sum(1 for keyword in keywords if keyword.lower() in query_lower)
+    return {
+        "primary": name_map.get(result["primary"], result["primary"]),
+        "scores": old_scores,
+        "p1_intent": result["primary"],
+        "p1_weights": result["weights"],
     }
 
 
 def _intent_multiplier(node: Dict[str, Any], intent: Dict[str, Any]) -> float:
+    # Support both old (temporal/causal/semantic) and new (why/when/entity/general) intent names
     primary = intent.get("primary") or "semantic"
+    # Normalize: accept p1_intent if present
+    p1 = intent.get("p1_intent") or primary
     props = node.get("properties", {}) or {}
     label = node.get("label") or ""
-    if primary == "temporal":
+    if p1 == "when" or primary == "temporal":
         has_time = any(props.get(key) for key in ("date", "time", "timestamp", "valid_from", "valid_until"))
         if has_time or label == "event":
             return 1.12
         return 0.96
-    if primary == "causal":
+    if p1 == "why" or primary == "causal":
+        if label in ("cause", "effect"):
+            return 1.35
+        role = props.get("role")
+        if role in ("cause", "effect"):
+            return 1.25
         searchable = _node_searchable_text(node)
         if any(term in searchable for term in ("\u539f\u56e0", "\u5bfc\u81f4", "\u56e0\u4e3a", "\u4f9d\u8d56", "caused", "cause", "depends")):
             return 1.12
         return 1.0
-    if primary == "entity":
+    if p1 == "entity" or primary == "entity":
         if label != "event" or any(props.get(key) for key in ("name", "title", "source_file", "agent_id", "sku", "brand")):
             return 1.12
         return 0.98
@@ -470,19 +616,25 @@ def _cache_put(key: str, data: Dict[str, float]):
     _graph_walk_cache[key] = (time.time(), data)
 
 
-def graph_walk(store, source_node_ids: List[str], hops: int = 2, max_neighbors_per_hop: int = 15) -> Dict[str, float]:
+def graph_walk(store, source_node_ids: List[str], hops: int = 2, max_neighbors_per_hop: int = 15, intent: Dict[str, Any] = None) -> Dict[str, float]:
     """Walk the graph from source nodes, returning {node_id: graph_score}.
 
     Score: 1-hop = 0.3, 2-hop = 0.15.  Uses SQLite queries (not in-memory graph).
     Results are cached for 5 minutes.
+
+    Args:
+        intent: Optional intent dict. When primary='causal', caused_by weight is boosted to 5.0.
     """
     if not source_node_ids:
         return {}
 
-    cache_key = _cache_key(source_node_ids, hops)
-    cached = _cache_get(cache_key)
-    if cached is not None:
-        return cached
+    # For causal intent, skip cache (different weights needed)
+    primary_intent = (intent or {}).get("primary", "semantic")
+    if primary_intent != "causal":
+        cache_key = _cache_key(source_node_ids, hops)
+        cached = _cache_get(cache_key)
+        if cached is not None:
+            return cached
 
     # BFS-style traversal
     visited: Set[str] = set(source_node_ids)
@@ -498,7 +650,14 @@ def graph_walk(store, source_node_ids: List[str], hops: int = 2, max_neighbors_p
         "mentions_entity": 1.0,
         "extracted_fact": 1.1,
         "related_to": 1.0,
+        "mentions_cause": 1.5,
+        "mentions_effect": 1.5,
     }
+    # P0 Causal boost: when query is "why"-type, boost causal edge weight to 5.0
+    if primary_intent in ("causal", "why"):
+        relation_weights["caused_by"] = 5.0
+        relation_weights["mentions_cause"] = 3.0
+        relation_weights["mentions_effect"] = 3.0
 
     for hop in range(1, hops + 1):
         if not current_frontier:
@@ -522,10 +681,146 @@ def graph_walk(store, source_node_ids: List[str], hops: int = 2, max_neighbors_p
             break
         current_frontier = next_frontier
 
-    # Only cache non-empty results
-    if result:
+    # Only cache non-empty results (skip for causal intent since weights differ)
+    if result and primary_intent != "causal":
         _cache_put(cache_key, result)
     return result
+
+
+def rrf_fusion(
+    ranked_lists: List[List[str]],
+    k: int = RRF_K,
+    weights: Optional[List[float]] = None,
+) -> List[Tuple[str, float]]:
+    """Reciprocal Rank Fusion: merge multiple ranked lists into one.
+
+    score(d) = Σ w_i / (k + rank_i(d))
+    Args:
+        ranked_lists: list of ranked result lists (each is list of node IDs)
+        k: RRF constant (default 60, per paper)
+        weights: optional per-list weights (default 1.0 each)
+    Returns:
+        sorted list of (node_id, rrf_score)
+    """
+    if not weights:
+        weights = [1.0] * len(ranked_lists)
+    scores: Dict[str, float] = {}
+    for ranked, w in zip(ranked_lists, weights):
+        for rank, nid in enumerate(ranked, start=1):
+            scores[nid] = scores.get(nid, 0.0) + w / (k + rank)
+    return sorted(scores.items(), key=lambda x: x[1], reverse=True)
+
+
+def beam_search(
+    store,
+    anchor_ids: List[str],
+    intent: Dict[str, Any],
+    beam_width: int = 5,
+    max_hops: int = 5,
+    prune_threshold: float = 0.3,
+    semantic_scores: Optional[Dict[str, float]] = None,
+) -> List[Dict[str, Any]]:
+    """P1 Beam Search: strategy-guided graph traversal from anchor nodes.
+
+    Follows high-weight edges based on intent. E.g., causal edges get
+    weight 5.0 when intent=why, enabling root-cause tracing.
+
+    Args:
+        store: graph store instance
+        anchor_ids: starting node IDs
+        intent: intent dict with primary label and weights
+        beam_width: top-k neighbors per hop (default 5)
+        max_hops: maximum traversal depth (default 5)
+        prune_threshold: minimum score to continue path (default 0.3)
+        semantic_scores: optional pre-computed semantic scores for nodes
+    Returns:
+        sorted list of {id, score, path, hop}
+    """
+    if not anchor_ids:
+        return []
+    weights = intent.get("weights") or INTENT_WEIGHTS.get("general", INTENT_WEIGHTS["general"])
+    w_causal = weights.get("w_causal", 1.0)
+    w_temporal = weights.get("w_temporal", 1.0)
+    w_entity = weights.get("w_entity", 1.0)
+    w_semantic = weights.get("w_semantic", 1.0)
+
+    # Edge type -> weight mapping (driven by intent)
+    edge_weight_map = {
+        "caused_by": w_causal,
+        "mentions_cause": w_causal * 0.6,
+        "mentions_effect": w_causal * 0.6,
+        "depends_on": w_causal * 0.4,
+        "mentions_entity": w_entity * 0.5,
+        "same_as": w_entity * 0.3,
+        "extracted_fact": w_semantic * 0.4,
+        "responded_by": w_temporal * 0.3,
+        "related_to": w_semantic * 0.3,
+    }
+
+    # BFS beam search
+    # Each beam entry: {id, score, path: [node_id, ...], hop: int}
+    beams: List[Dict[str, Any]] = []
+    for aid in anchor_ids:
+        beams.append({"id": aid, "score": 1.0, "path": [aid], "hop": 0})
+
+    visited: Set[str] = set(anchor_ids)
+    completed: List[Dict[str, Any]] = list(beams)
+
+    for hop in range(1, max_hops + 1):
+        if not beams:
+            break
+        # Expand all current beams - query neighbors per beam node
+        candidates: List[Dict[str, Any]] = []
+        for beam in beams:
+            beam_id = beam["id"]
+            try:
+                neighbors = store.get_neighbor_ids_with_relations([beam_id])
+            except Exception:
+                continue
+            for item in neighbors:
+                nid = item["id"]
+                rel = item["relation"]
+                if not nid or nid in visited:
+                    continue
+                # Compute edge score
+                edge_w = edge_weight_map.get(rel, w_semantic * 0.2)
+                # Semantic affinity (if available)
+                sem = (semantic_scores or {}).get(nid, 0.0)
+                # Structure alignment + semantic affinity
+                struct_score = edge_w * 0.6
+                sem_score = sem * w_semantic * 0.4
+                total = struct_score + sem_score
+                # Normalize by hop depth
+                if hop > 1:
+                    total *= (1.0 / hop)
+                path_score = beam["score"] * total
+                if path_score < prune_threshold:
+                    continue
+                candidates.append({
+                    "id": nid,
+                    "score": path_score,
+                    "path": beam["path"] + [nid],
+                    "hop": hop,
+                    "edge_relation": rel,
+                })
+
+        if not candidates:
+            break
+
+        # Keep top-k (beam width)
+        candidates.sort(key=lambda x: x["score"], reverse=True)
+        beams = candidates[:beam_width]
+        for c in beams:
+            visited.add(c["id"])
+        completed.extend(beams)
+
+    # De-dup and sort
+    seen: Dict[str, Dict[str, Any]] = {}
+    for item in completed:
+        nid = item["id"]
+        if nid not in seen or item["score"] > seen[nid]["score"]:
+            seen[nid] = item
+    return sorted(seen.values(), key=lambda x: x["score"], reverse=True)
 
 
 class MemorySearcher:
@@ -567,13 +862,14 @@ class MemorySearcher:
         label = filters.get("label")
         pool_size = int(filters.get("pool_size", 99999))
         property_filters = _property_filters(filters)
-        intent = filters.get("intent") or detect_intent(query)
+        intent = filters.get("intent") or classify_intent(query)
         include_related = bool(filters.get("include_related", False))
         related_limit = int(filters.get("related_limit", 3))
         include_versions = bool(filters.get("include_versions", False))
         version_limit = int(filters.get("version_limit", 2))
         query_entities = extract_entities(query)
         query_scope = classify_memory_scope(query_entities)
+        recency_query = _detect_recency_intent(query)
 
         # --- Pre-compute shared query data once ---
         query_lower = query.lower()
@@ -671,6 +967,10 @@ class MemorySearcher:
             entity_scope = _entity_overlap_multiplier(query_entities, node)
             quality_scope = _memory_quality_multiplier(node)
             authority_scope = _operational_authority_multiplier(query, node, keyword_score)
+            props_for_recency = node.get("properties") or {}
+            layer_for_recency = props_for_recency.get("layer")
+            age_hours = _node_age_hours(node)
+            recency_boost = _compute_recency_boost(age_hours, recency_query, layer_for_recency)
             combined = (
                 (semantic_score * 0.75 + keyword_score * 0.25)
                 * lifecycle
@@ -679,6 +979,7 @@ class MemorySearcher:
                 * entity_scope
                 * quality_scope
                 * authority_scope
+                * recency_boost
             )
             if combined <= 0:
                 continue
@@ -700,6 +1001,9 @@ class MemorySearcher:
                 "entity_scope": round(float(entity_scope), 4),
                 "quality_scope": round(float(quality_scope), 4),
                 "authority_scope": round(float(authority_scope), 4),
+                "recency_boost": round(float(recency_boost), 4),
+                "age_hours": round(float(age_hours), 2) if age_hours is not None else None,
+                "recency_query": recency_query,
                 "combined_before_floor": round(float(original_combined), 4),
                 "floor_applied": round(float(combined), 4) != round(float(original_combined), 4),
             }
@@ -711,6 +1015,9 @@ class MemorySearcher:
             node["entity_overlap_multiplier"] = round(float(entity_scope), 6)
             node["memory_quality_multiplier"] = round(float(quality_scope), 6)
             node["operational_authority_multiplier"] = round(float(authority_scope), 6)
+            node["recency_boost"] = round(float(recency_boost), 6)
+            node["age_hours"] = round(float(age_hours), 2) if age_hours is not None else None
+            node["recency_query"] = recency_query
             node["query_entities"] = query_entities
             node["query_scope"] = query_scope
             node["query_intent"] = intent
@@ -729,7 +1036,7 @@ class MemorySearcher:
         if len(results) > 0:
             graph_seed_size = min(max(top_k * 2, 10), len(results))
             seed_ids = [item["id"] for item in results[:graph_seed_size]]
-            graph_scores = graph_walk(self.store, seed_ids, hops=2)
+            graph_scores = graph_walk(self.store, seed_ids, hops=2, intent=intent)
 
             if graph_scores:
                 existing_ids = {item["id"] for item in results}
@@ -767,11 +1074,16 @@ class MemorySearcher:
                         entity_scope = _entity_overlap_multiplier(query_entities, node)
                         quality_scope = _memory_quality_multiplier(node)
                         authority_scope = _operational_authority_multiplier(query, node, keyword_score)
+                        props_for_recency = node.get("properties") or {}
+                        layer_for_recency = props_for_recency.get("layer")
+                        age_hours = _node_age_hours(node)
+                        recency_boost = _compute_recency_boost(age_hours, recency_query, layer_for_recency)
                         graph_score = graph_scores[nid]
                         original_combined = (
                             base_score
                             * lifecycle * agent_scope * intent_scope
                             * entity_scope * quality_scope * authority_scope
+                            * recency_boost
                         )
                         fused = original_combined * 0.7 + graph_score * 0.3
                         if fused <= 0:
@@ -787,6 +1099,9 @@ class MemorySearcher:
                             "entity_scope": round(float(entity_scope), 4),
                             "quality_scope": round(float(quality_scope), 4),
                             "authority_scope": round(float(authority_scope), 4),
+                            "recency_boost": round(float(recency_boost), 4),
+                            "age_hours": round(float(age_hours), 2) if age_hours is not None else None,
+                            "recency_query": recency_query,
                             "graph_score": round(graph_score, 4),
                             "fused_score": round(float(fused), 4),
                         }
@@ -798,6 +1113,9 @@ class MemorySearcher:
                         node["entity_overlap_multiplier"] = round(float(entity_scope), 6)
                         node["memory_quality_multiplier"] = round(float(quality_scope), 6)
                         node["operational_authority_multiplier"] = round(float(authority_scope), 6)
+                        node["recency_boost"] = round(float(recency_boost), 6)
+                        node["age_hours"] = round(float(age_hours), 2) if age_hours is not None else None
+                        node["recency_query"] = recency_query
                         node["query_entities"] = query_entities
                         node["query_scope"] = query_scope
                         node["query_intent"] = intent
@@ -814,6 +1132,138 @@ class MemorySearcher:
                 # Re-sort with graph-boosted scores
                 results.sort(key=lambda item: item["score"], reverse=True)
 
+        # --- P1: RRF Fusion (Reciprocal Rank Fusion) ---
+        # Build 3 ranked lists: semantic, keyword, temporal
+        p1_intent = intent.get("p1_intent") or intent.get("primary", "general")
+        intent_weights = intent.get("p1_weights") or INTENT_WEIGHTS.get(p1_intent, INTENT_WEIGHTS["general"])
+
+        if results:
+            # Semantic ranked list (by semantic_score desc)
+            semantic_ranked = sorted(results, key=lambda x: x.get("semantic_score", 0), reverse=True)
+            semantic_ids = [r["id"] for r in semantic_ranked]
+
+            # Keyword ranked list (by keyword_score desc)
+            keyword_ranked = sorted(results, key=lambda x: x.get("keyword_score", 0), reverse=True)
+            keyword_ids = [r["id"] for r in keyword_ranked]
+
+            # Temporal ranked list (by created_at recency)
+            def _temporal_sort_key(node):
+                dt = _parse_time((node.get("properties") or {}).get("created_at"))
+                return dt.timestamp() if dt else 0.0
+            temporal_ranked = sorted(results, key=_temporal_sort_key, reverse=True)
+            temporal_ids = [r["id"] for r in temporal_ranked]
+
+            # RRF fusion with intent-driven weights
+            rrf_weight_map = {
+                "semantic": intent_weights.get("w_semantic", 1.0),
+                "keyword": 1.0,
+                "temporal": intent_weights.get("w_temporal", 1.0),
+            }
+            rrf_result = rrf_fusion(
+                [semantic_ids, keyword_ids, temporal_ids],
+                k=RRF_K,
+                weights=[rrf_weight_map["semantic"], rrf_weight_map["keyword"], rrf_weight_map["temporal"]],
+            )
+            rrf_scores = {nid: score for nid, score in rrf_result}
+
+            # Apply RRF as a blended signal (keep original scoring structure, add RRF as boost)
+            for item in results:
+                rrf_s = rrf_scores.get(item["id"], 0.0)
+                if rrf_s > 0:
+                    original = item["score"]
+                    # Blend: 70% original + 30% RRF (normalized)
+                    max_rrf = rrf_result[0][1] if rrf_result else 1.0
+                    rrf_normalized = rrf_s / max(max_rrf, 1e-10)
+                    blended = original * 0.7 + rrf_normalized * original * 0.3
+                    item["score"] = round(blended, 6)
+                    item["score_breakdown"]["rrf_score"] = round(rrf_s, 6)
+                    item["score_breakdown"]["rrf_normalized"] = round(rrf_normalized, 4)
+
+            results.sort(key=lambda x: x["score"], reverse=True)
+
+        # --- P1: Beam Search (strategy-guided graph traversal) ---
+        # Only run beam search for structured intents (why/when/entity), skip for general
+        if p1_intent in ("why", "when", "entity") and results:
+            beam_anchor_count = min(max(top_k, 5), len(results))
+            anchor_ids = [r["id"] for r in results[:beam_anchor_count]]
+            semantic_score_map = {r["id"]: r.get("semantic_score", 0.0) for r in results}
+
+            beam_results = beam_search(
+                self.store,
+                anchor_ids,
+                intent,
+                beam_width=5,
+                max_hops=5,
+                prune_threshold=0.3,
+                semantic_scores=semantic_score_map,
+            )
+
+            if beam_results:
+                existing_ids = {item["id"] for item in results}
+                # Merge beam-discovered nodes into results
+                for br in beam_results:
+                    nid = br["id"]
+                    if nid in existing_ids:
+                        # Boost existing node score based on beam discovery
+                        for item in results:
+                            if item["id"] == nid:
+                                beam_boost = br["score"] * 0.15
+                                item["score"] = round(item["score"] + beam_boost, 6)
+                                item["score_breakdown"]["beam_boost"] = round(beam_boost, 4)
+                                item["beam_path"] = br["path"]
+                                item["beam_hop"] = br["hop"]
+                                break
+                    else:
+                        # Fetch and score beam-discovered node
+                        node = self.store.get_node(nid)
+                        if node and node.get("status") != "deleted":
+                            searchable = _node_searchable_text(node)
+                            keyword_score = _keyword_score(query, node, searchable, query_terms)
+                            semantic_score = semantic_score_map.get(nid, 0.0)
+                            base_score = semantic_score * 0.75 + keyword_score * 0.25
+                            lifecycle = _lifecycle_multiplier(node)
+                            intent_scope = _intent_multiplier(node, intent)
+                            quality_scope = _memory_quality_multiplier(node)
+                            beam_score = br["score"] * 0.15
+                            props_for_recency = node.get("properties") or {}
+                            layer_for_recency = props_for_recency.get("layer")
+                            age_hours = _node_age_hours(node)
+                            recency_boost = _compute_recency_boost(age_hours, recency_query, layer_for_recency)
+                            combined = base_score * lifecycle * intent_scope * quality_scope * recency_boost + beam_score
+                            if combined <= 0:
+                                continue
+                            provenance = _provenance(node)
+                            memory_scope = _memory_scope(node)
+                            node["score"] = round(float(combined), 6)
+                            node["score_breakdown"] = {
+                                "base": round(base_score, 4),
+                                "lifecycle": round(float(lifecycle), 4),
+                                "intent_scope": round(float(intent_scope), 4),
+                                "quality_scope": round(float(quality_scope), 4),
+                                "recency_boost": round(float(recency_boost), 4),
+                                "age_hours": round(float(age_hours), 2) if age_hours is not None else None,
+                                "recency_query": recency_query,
+                                "beam_score": round(beam_score, 4),
+                            }
+                            node["semantic_score"] = round(float(semantic_score), 6)
+                            node["keyword_score"] = round(float(keyword_score), 6)
+                            node["query_entities"] = query_entities
+                            node["query_scope"] = query_scope
+                            node["query_intent"] = intent
+                            node["memory_scope"] = memory_scope
+                            node["retrieval_source"] = "beam_search"
+                            node["beam_path"] = br["path"]
+                            node["beam_hop"] = br["hop"]
+                            node["beam_edge"] = br.get("edge_relation")
+                            node["provenance"] = provenance
+                            node["source_agent_id"] = provenance.get("agent_id")
+                            node["memory_source"] = provenance.get("source")
+                            node["source_session_key"] = provenance.get("session_key")
+                            results.append(node)
+                            existing_ids.add(nid)
+
+                results.sort(key=lambda x: x["score"], reverse=True)
+
         results = _promote_operational_anchor(results, top_k, query)
         results = _diversify_by_scope(results, top_k, query_scope)
         if include_related:
@@ -829,5 +1279,18 @@ class MemorySearcher:
                     item["id"],
                     limit=version_limit,
                 )
+
+        # P0 Causal chain context: when intent is causal/why, attach causal chains
+        if intent.get("primary") in ("causal", "why") or p1_intent == "why":
+            for item in results[:top_k]:
+                causal_edges = self.store.get_causal_edges(item["id"], direction="both")
+                if causal_edges:
+                    item["causal_edges"] = causal_edges
+                    item["causal_chain"] = self.store.get_causal_chain(item["id"], max_depth=3)
+                    # Boost score for nodes with causal connections
+                    causal_boost = 1.0 + 0.3 * len(causal_edges)
+                    item["score"] = round(item["score"] * min(causal_boost, 2.0), 6)
+                    item["score_breakdown"]["causal_boost"] = round(causal_boost, 4)
+
         self.store.touch_nodes([item["id"] for item in results])
         return results

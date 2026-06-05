@@ -1,0 +1,31 @@
+{
+  "test1_speed": {
+    "elapsed": 30.1226065158844,
+    "facts_count": 0,
+    "status": "SLOW"
+  },
+  "test2_query": {
+    "elapsed": 0.26551175117492676,
+    "count": 5,
+    "has_breakdown": true,
+    "status": "PASS"
+  },
+  "test3_recall": {
+    "error": "the JSON object must be str, bytes or bytearray, not NoneType",
+    "status": "FAIL"
+  },
+  "test4_faiss": {
+    "avg_ms": 167.17448234558105,
+    "min_ms": 153.7017822265625,
+    "max_ms": 176.8636703491211,
+    "status": "PASS"
+  },
+  "test5_quality": {
+    "elapsed": 30.137720346450806,
+    "facts_count": 0,
+    "has_time": false,
+    "has_decision": false,
+    "has_todo": false,
+    "status": "FAIL"
+  }
+}

@@ -58,6 +58,7 @@ class SQLiteStore:
             );
             CREATE INDEX IF NOT EXISTS idx_edges_source ON edges(source_id);
             CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target_id);
+            CREATE INDEX IF NOT EXISTS idx_edges_relation ON edges(relation);
             CREATE INDEX IF NOT EXISTS idx_nodes_label ON nodes(label);
             CREATE TABLE IF NOT EXISTS recall_events (
                 id TEXT PRIMARY KEY,
@@ -724,6 +725,99 @@ class SQLiteStore:
             (node_id, node_id)
         )
         return [{"source": r[0], "target": r[1], "relation": r[2], "properties": json.loads(r[3])} for r in cur.fetchall()]
+
+    def add_causal_edge(self, source_id: str, target_id: str, confidence: float = 0.5,
+                        rationale: str = "", inferred_by: str = "llm"):
+        """Add a causal edge: source_id caused_by target_id (target caused source).
+
+        Args:
+            source_id: The effect node (果).
+            target_id: The cause node (因).
+            confidence: 0.0-1.0 confidence in this causal relationship.
+            rationale: Explanation of why this causal link was inferred.
+            inferred_by: What inferred this edge (e.g. 'llm', 'manual').
+        """
+        props = {
+            "confidence": max(0.0, min(1.0, confidence)),
+            "rationale": rationale,
+            "inferred_by": inferred_by,
+        }
+        self.add_edge_once(source_id, target_id, "caused_by", props)
+
+    def get_causal_edges(self, node_id: str, direction: str = "both") -> List[Dict]:
+        """Get causal edges for a node.
+
+        Args:
+            node_id: The node to query.
+            direction: 'outgoing' (node caused_by X), 'incoming' (X caused_by node), or 'both'.
+
+        Returns:
+            List of causal edge dicts with confidence, rationale.
+        """
+        if direction == "outgoing":
+            cur = self._conn.execute(
+                """SELECT source_id, target_id, relation, properties FROM edges
+                   WHERE source_id = ? AND relation = 'caused_by'""",
+                (node_id,)
+            )
+        elif direction == "incoming":
+            cur = self._conn.execute(
+                """SELECT source_id, target_id, relation, properties FROM edges
+                   WHERE target_id = ? AND relation = 'caused_by'""",
+                (node_id,)
+            )
+        else:
+            cur = self._conn.execute(
+                """SELECT source_id, target_id, relation, properties FROM edges
+                   WHERE (source_id = ? OR target_id = ?) AND relation = 'caused_by'""",
+                (node_id, node_id)
+            )
+        results = []
+        for r in cur.fetchall():
+            props = json.loads(r[3])
+            results.append({
+                "source": r[0],
+                "target": r[1],
+                "relation": r[2],
+                "confidence": props.get("confidence", 0.5),
+                "rationale": props.get("rationale", ""),
+                "inferred_by": props.get("inferred_by", "unknown"),
+            })
+        return results
+
+    def get_causal_chain(self, node_id: str, max_depth: int = 5) -> List[List[Dict]]:
+        """Walk causal chain backwards from a node to find root causes.
+
+        Returns list of chains, each chain is a list of {node_id, confidence, rationale}.
+        """
+        chains = []
+        visited = set()
+
+        def _walk_back(current_id: str, path: List[Dict], depth: int):
+            if depth >= max_depth or current_id in visited:
+                if path:
+                    chains.append(list(path))
+                return
+            visited.add(current_id)
+            # Find causes of current node (current caused_by cause)
+            causal_edges = self.get_causal_edges(current_id, direction="outgoing")
+            if not causal_edges:
+                if path:
+                    chains.append(list(path))
+                return
+            for edge in causal_edges:
+                cause_id = edge["target"]
+                path.append({
+                    "node_id": cause_id,
+                    "confidence": edge["confidence"],
+                    "rationale": edge["rationale"],
+                })
+                _walk_back(cause_id, path, depth + 1)
+                path.pop()
+            visited.discard(current_id)
+
+        _walk_back(node_id, [], 0)
+        return chains
 
     def get_related_context(self, node_id: str, limit: int = 3, relations: List[str] = None) -> List[Dict]:
         where = ["(e.source_id = ? OR e.target_id = ?)"]

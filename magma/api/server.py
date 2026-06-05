@@ -145,6 +145,11 @@ class QueryResponse(BaseModel):
     query: str
     results: list
     count: int
+    intent: Optional[dict] = None
+    narrative: Optional[str] = None
+    references: Optional[list] = None
+    token_budget: Optional[int] = None
+    tokens_used: Optional[int] = None
 
 
 class FeedbackRequest(BaseModel):
@@ -256,14 +261,18 @@ def create_app() -> FastAPI:
     @app.post("/api/v1/query", response_model=QueryResponse)
     async def query(req: QueryRequest):
         from magma.graph.sqlite_store import get_store
-        from magma.search import MemorySearcher
+        from magma.search import MemorySearcher, classify_intent
         from magma.vector.encoder import Encoder
 
         store = getattr(app.state, "store", None) or get_store()
         encoder = getattr(app.state, "encoder", None) or Encoder()
         faiss_index = getattr(app.state, "faiss_index", None)
+        # P1: classify intent before search
+        intent = classify_intent(req.query)
+        filters = dict(req.filters or {})
+        filters["intent"] = intent
         searcher = MemorySearcher(store, encoder, faiss_index)
-        results = await asyncio.to_thread(searcher.query, req.query, req.top_k, req.filters)
+        results = await asyncio.to_thread(searcher.query, req.query, req.top_k, filters)
         if not results:
             results = [{
                 "id": "system",
@@ -272,7 +281,29 @@ def create_app() -> FastAPI:
                 "score": 0.0,
                 "source": "system",
             }]
-        return QueryResponse(query=req.query, results=results, count=len(results))
+
+        # P2: Context Synthesis — generate narrative from graph topology
+        narrative_data = None
+        try:
+            from magma.context_synthesis import synthesize_narrative
+            narrative_data = await asyncio.to_thread(
+                synthesize_narrative, results, req.query, intent, store
+            )
+        except Exception as e:
+            logger.warning(f"Context synthesis failed (non-fatal): {e}")
+            import traceback
+            logger.warning(traceback.format_exc())
+
+        return QueryResponse(
+            query=req.query,
+            results=results,
+            count=len(results),
+            intent=intent,
+            narrative=narrative_data.get("narrative") if narrative_data else None,
+            references=narrative_data.get("references") if narrative_data else None,
+            token_budget=narrative_data.get("token_budget") if narrative_data else None,
+            tokens_used=narrative_data.get("tokens_used") if narrative_data else None,
+        )
 
     @app.post("/api/v1/nodes")
     async def add_node(req: NodeRequest):
@@ -370,9 +401,9 @@ def create_app() -> FastAPI:
         return {"status": "ok", "written": written, "count": len(written)}
 
     async def _extract_facts_background(req, written, encoder, store, faiss_index, extract_facts_fn):
-        """Background task: extract facts without blocking capture response."""
+        """Background task: extract facts + causal relations without blocking capture response."""
         try:
-            from magma.fact_extractor import extract_facts_batch
+            from magma.fact_extractor import extract_facts_batch, extract_causal_batch
             facts = await asyncio.to_thread(extract_facts_batch, req.user_text, req.assistant_text)
             for fact_item in facts:
                 fact_text = fact_item["fact"]
@@ -428,6 +459,85 @@ def create_app() -> FastAPI:
                         await asyncio.to_thread(faiss_index.add, fact_node_id, fact_embedding)
                     except Exception as e:
                         logger.warning(f"FAISS incremental add for fact failed: {e}")
+
+            # --- P0 Causal Extraction (runs after fact extraction) ---
+            try:
+                causal_relations = await asyncio.to_thread(extract_causal_batch, req.user_text, req.assistant_text)
+                for rel in causal_relations:
+                    cause_text = rel["cause"]
+                    effect_text = rel["effect"]
+                    confidence = rel["confidence"]
+                    rationale = rel["rationale"]
+
+                    # Create or find cause node
+                    cause_digest = hashlib.sha1(
+                        f"{req.source}:cause:{cause_text}".encode("utf-8")
+                    ).hexdigest()[:16]
+                    cause_node_id = f"cause:{cause_digest}"
+                    cause_props = {
+                        "layer": "L0",
+                        "source": req.source,
+                        "role": "cause",
+                        "content": cause_text,
+                        "agent_id": req.agent_id,
+                        "session_key": req.session_key,
+                        "ttl_days": 365,
+                        "importance": 0.6,
+                        "source_agent_id": _parse_source_agent(req.session_key) or req.agent_id,
+                        "department": DEPT_MAP.get(_parse_source_agent(req.session_key) or req.agent_id or "", ""),
+                    }
+                    cause_props.update(await asyncio.to_thread(_memory_metadata, cause_text))
+                    cause_emb = await asyncio.to_thread(encoder.encode, cause_text)
+                    cause_emb = cause_emb.astype("float32")
+                    await asyncio.to_thread(store.add_node, cause_node_id, "cause", cause_props, cause_emb)
+
+                    # Create or find effect node
+                    effect_digest = hashlib.sha1(
+                        f"{req.source}:effect:{effect_text}".encode("utf-8")
+                    ).hexdigest()[:16]
+                    effect_node_id = f"effect:{effect_digest}"
+                    effect_props = {
+                        "layer": "L0",
+                        "source": req.source,
+                        "role": "effect",
+                        "content": effect_text,
+                        "agent_id": req.agent_id,
+                        "session_key": req.session_key,
+                        "ttl_days": 365,
+                        "importance": 0.6,
+                        "source_agent_id": _parse_source_agent(req.session_key) or req.agent_id,
+                        "department": DEPT_MAP.get(_parse_source_agent(req.session_key) or req.agent_id or "", ""),
+                    }
+                    effect_props.update(await asyncio.to_thread(_memory_metadata, effect_text))
+                    effect_emb = await asyncio.to_thread(encoder.encode, effect_text)
+                    effect_emb = effect_emb.astype("float32")
+                    await asyncio.to_thread(store.add_node, effect_node_id, "effect", effect_props, effect_emb)
+
+                    # Add causal edge: effect caused_by cause
+                    await asyncio.to_thread(store.add_causal_edge, effect_node_id, cause_node_id, confidence, rationale, "llm")
+
+                    # Link causal nodes to event nodes
+                    for evt_id in written:
+                        await asyncio.to_thread(store.add_edge_once, evt_id, cause_node_id, "mentions_cause", {
+                            "source": req.source,
+                        })
+                        await asyncio.to_thread(store.add_edge_once, evt_id, effect_node_id, "mentions_effect", {
+                            "source": req.source,
+                        })
+
+                    # Add to FAISS index
+                    if faiss_index:
+                        try:
+                            await asyncio.to_thread(faiss_index.add, cause_node_id, cause_emb)
+                            await asyncio.to_thread(faiss_index.add, effect_node_id, effect_emb)
+                        except Exception as e:
+                            logger.warning(f"FAISS add for causal nodes failed: {e}")
+
+                    logger.info(f"Causal edge created: {effect_node_id} caused_by {cause_node_id} (conf={confidence:.2f})")
+
+            except Exception as e:
+                logger.warning(f"Background causal extraction failed (non-fatal): {e}")
+
         except Exception as e:
             logger.warning(f"Background fact extraction failed (non-fatal): {e}")
 
