@@ -1,4 +1,4 @@
-"""50-check product benchmark for MAGMA.
+"""Product benchmark for MAGMA.
 
 This benchmark exercises the product capabilities that make MAGMA more than a
 plain vector-memory layer:
@@ -219,6 +219,55 @@ def run_benchmark(api_base: str) -> dict[str, Any]:
             core_block,
         ))
 
+        # L1 distillation: stable high-value summaries from L0 memories.
+        l1_source = bench.add_node(
+            "l1_source",
+            "event",
+            f"老板偏好：MAGMA benchmark {run_id} L1 提炼必须沉淀长期产品化原则。",
+            role="user",
+            layer="L0",
+            source_agent_id="benchmark",
+        )
+        l1_written: list[str] = []
+
+        bench.check("l1_distill_dry_run", "l1_distill", lambda: (
+            client.post("/api/v1/distill_l1", {
+                "hours": 24,
+                "limit": 50,
+                "dry_run": True,
+                "source_agent_id": "benchmark",
+            }, timeout=60).get("candidate_count", 0) >= 1,
+            {},
+        ))
+
+        def l1_distill_apply() -> tuple[bool, dict[str, Any]]:
+            body = client.post("/api/v1/distill_l1", {
+                "hours": 24,
+                "limit": 50,
+                "dry_run": False,
+                "source_agent_id": "benchmark",
+            }, timeout=90)
+            l1_written.extend(body.get("written") or [])
+            bench.cleanup_nodes.extend(l1_written)
+            return body.get("status") == "ok" and body.get("written_count", 0) >= 1, {
+                "written_count": body.get("written_count"),
+                "by_kind": body.get("by_kind"),
+                "written": body.get("written", [])[:5],
+            }
+
+        bench.check("l1_distill_apply", "l1_distill", l1_distill_apply)
+        bench.check("l1_distill_queryable", "l1_distill", lambda: bench.query_contains(
+            f"benchmark {run_id} L1 长期产品化原则",
+            run_id,
+        ))
+        bench.check("l1_distill_evidence_edge", "l1_distill", lambda: (
+            bool(l1_written) and l1_source in json.dumps(
+                client.get(f"/api/v1/nodes/{urllib.parse.quote(l1_written[0], safe='')}"),
+                ensure_ascii=False,
+            ),
+            {"l1_written": l1_written[:3], "source": l1_source},
+        ))
+
         # Short-command local routing: 8 checks
         recent_nodes = [{
             "id": f"bench:{run_id}:question",
@@ -428,7 +477,7 @@ def run_benchmark(api_base: str) -> dict[str, Any]:
         "passed": passed,
         "failed": total - passed,
         "pct": round(passed / total * 100, 1) if total else 0.0,
-        "pass": total == 50 and passed == total,
+        "pass": total >= 50 and passed == total,
         "cases": bench.reports,
     }
 

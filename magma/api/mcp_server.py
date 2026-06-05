@@ -53,7 +53,7 @@ async def list_tools() -> List[Tool]:
     # Core tools (P0): query, add_node, add_edge, list_nodes, get_node,
     #                   feedback, delete_node, update_node, consolidate,
     #                   doctor, stats, search_by_entity
-    # Extension tools (P0-3): memory_edit, memory_forget, core_memory_get/set, timeline
+    # Extension tools (P0-3): memory_edit, memory_forget, core_memory_get/set, timeline, distill_l1
     # Extension tools (P1): entity_add, entity_remove, entity_list, explain/mark tools
     return [
         Tool(
@@ -222,6 +222,19 @@ async def list_tools() -> List[Tool]:
             },
         ),
         Tool(
+            name="magma_distill_l1",
+            description="Distill recent L0 auto-captured memories into stable L1 memories (decision, preference, project_state, pending_action, lesson, fact).",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "hours": {"type": "integer", "description": "Lookback window in hours (default 24)", "default": 24},
+                    "limit": {"type": "integer", "description": "Max recent L0 nodes to scan (default 200)", "default": 200},
+                    "dry_run": {"type": "boolean", "description": "Preview only without writing L1 nodes", "default": False},
+                    "source_agent_id": {"type": "string", "description": "Optional source agent filter for scoped distillation"},
+                },
+            },
+        ),
+        Tool(
             name="magma_doctor",
             description="Enhanced health check: node/edge counts, FAISS status, recent capture stats.",
             inputSchema={
@@ -375,6 +388,8 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> List[TextContent]:
             return await _handle_update_node(arguments)
         elif name == "magma_consolidate":
             return await _handle_consolidate(arguments)
+        elif name == "magma_distill_l1":
+            return await _handle_distill_l1(arguments)
         elif name == "magma_doctor":
             return await _handle_doctor(arguments)
         elif name == "magma_stats":
@@ -554,6 +569,17 @@ async def _handle_update_node(args: Dict[str, Any]) -> List[TextContent]:
 async def _handle_consolidate(args: Dict[str, Any]) -> List[TextContent]:
     """Proxy to POST /api/v1/consolidate"""
     result = _api_request("POST", "/api/v1/consolidate")
+    return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
+
+
+async def _handle_distill_l1(args: Dict[str, Any]) -> List[TextContent]:
+    """Proxy to POST /api/v1/distill_l1."""
+    result = _api_request("POST", "/api/v1/distill_l1", {
+        "hours": args.get("hours", 24),
+        "limit": args.get("limit", 200),
+        "dry_run": bool(args.get("dry_run", False)),
+        "source_agent_id": args.get("source_agent_id"),
+    })
     return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
 
 

@@ -192,6 +192,13 @@ class SuppressPatternRequest(BaseModel):
     ttl_days: Optional[int] = None
 
 
+class L1DistillRequest(BaseModel):
+    hours: int = 24
+    limit: int = 200
+    dry_run: bool = False
+    source_agent_id: Optional[str] = None
+
+
 def create_app() -> FastAPI:
     """Create and configure the FastAPI application."""
 
@@ -694,6 +701,37 @@ def create_app() -> FastAPI:
 
         store = getattr(app.state, "store", None) or get_store()
         return {"status": "ok", "stats": store.consolidate(purge_deleted=purge_deleted)}
+
+    @app.post("/api/v1/distill_l1")
+    async def distill_l1(req: L1DistillRequest):
+        from magma.graph.sqlite_store import get_store
+        from magma.l1_distiller import distill_l1 as run_distill_l1
+        from magma.vector.encoder import Encoder
+
+        store = getattr(app.state, "store", None) or get_store()
+        encoder = getattr(app.state, "encoder", None) or Encoder()
+        result = await asyncio.to_thread(
+            run_distill_l1,
+            store,
+            encoder,
+            hours=max(1, req.hours),
+            limit=max(1, min(req.limit, 2000)),
+            dry_run=req.dry_run,
+            source_agent_id=req.source_agent_id,
+        )
+        faiss_index = getattr(app.state, "faiss_index", None)
+        if faiss_index and not req.dry_run:
+            for node_id in result.get("written", []):
+                node = store.get_node(node_id)
+                if not node:
+                    continue
+                try:
+                    text = _node_text(node.get("label", ""), node.get("properties") or {})
+                    embedding = await asyncio.to_thread(encoder.encode, text)
+                    await asyncio.to_thread(faiss_index.add, node_id, embedding.astype("float32"))
+                except Exception as e:
+                    logger.warning(f"FAISS L1 incremental add failed for {node_id}: {e}")
+        return result
 
     @app.post("/api/v1/backup")
     async def backup():
