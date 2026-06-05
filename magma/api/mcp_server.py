@@ -223,11 +223,12 @@ async def list_tools() -> List[Tool]:
         ),
         Tool(
             name="magma_core_memory_get",
-            description="Get the agent's core memory blocks (persona, human, custom). These are the agent's working memory.",
+            description="Get first-class core memory blocks (persona, preferences, project state, current tasks, operational rules).",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "agent_id": {"type": "string", "description": "Agent ID to get core memory for (optional, defaults to caller)"},
+                    "block_name": {"type": "string", "description": "Optional block name filter"},
                 },
             },
         ),
@@ -514,53 +515,33 @@ async def _handle_memory_forget(args: Dict[str, Any]) -> List[TextContent]:
 
 async def _handle_core_memory_get(args: Dict[str, Any]) -> List[TextContent]:
     """Get core memory blocks for an agent."""
-    agent_id = args.get("agent_id", "")
-    result = _api_request("POST", "/api/v1/query", {
-        "query": "core_memory current_state persona",
-        "top_k": 10,
-        "filters": {"label": "topic", "layer": "current_state"},
-    })
-    results = result.get("results", result)
-    if not isinstance(results, list):
-        results = [results]
-    # Filter to core_memory blocks
-    core_blocks = [
-        r for r in results
-        if (r.get("properties") or {}).get("layer") in ("current_state", "core_memory")
-        or r.get("label") == "topic"
-    ]
-    if not core_blocks:
-        core_blocks = [{"info": "No core memory blocks found. Use magma_core_memory_set to create one."}]
-    return [TextContent(type="text", text=json.dumps(core_blocks, ensure_ascii=False, indent=2))]
+    params = []
+    if args.get("agent_id"):
+        params.append(("agent_id", args["agent_id"]))
+    if args.get("block_name"):
+        params.append(("block_name", args["block_name"]))
+    query_str = urllib.parse.urlencode(params)
+    path = f"/api/v1/core_memory?{query_str}" if query_str else "/api/v1/core_memory"
+    result = _api_request("GET", path)
+    if not result.get("blocks"):
+        result["blocks"] = [{"info": "No core memory blocks found. Use magma_core_memory_set to create one."}]
+    return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
 
 
 async def _handle_core_memory_set(args: Dict[str, Any]) -> List[TextContent]:
     """Set/update a core memory block."""
-    block_name = args["block_name"]
-    content = args["content"]
-    agent_id = args.get("agent_id", "")
-    node_id = f"core_memory:{block_name}:{agent_id or 'default'}"
-    properties = {
-        "layer": "current_state",
-        "kind": "current_state",
-        "content": content,
-        "block_name": block_name,
+    result = _api_request("PUT", "/api/v1/core_memory", {
+        "block_name": args["block_name"],
+        "content": args["content"],
+        "agent_id": args.get("agent_id"),
         "source": "agent_self_edit",
         "importance": 0.95,
-        "memory_scope": "system",
-    }
-    # Try update first, then add
-    try:
-        existing = _api_request("GET", f"/api/v1/nodes/{node_id}")
-        result = _api_request("PATCH", f"/api/v1/nodes/{node_id}", properties)
-        return [TextContent(type="text", text=f"Core memory block '{block_name}' updated.")]
-    except RuntimeError:
-        result = _api_request("POST", "/api/v1/nodes", {
-            "id": node_id,
-            "label": "topic",
-            "properties": properties,
-        })
-        return [TextContent(type="text", text=f"Core memory block '{block_name}' created.")]
+    })
+    block = result.get("block") or {}
+    return [TextContent(
+        type="text",
+        text=f"Core memory block '{args['block_name']}' saved as {block.get('id', 'unknown')}."
+    )]
 
 
 async def _handle_timeline(args: Dict[str, Any]) -> List[TextContent]:

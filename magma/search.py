@@ -182,7 +182,7 @@ OPERATIONAL_TRIGGER_KEYWORDS = OPERATIONAL_KEYWORDS + (
     "\u8bb0\u5fc6",
 )
 
-HIGH_DENSITY_LAYERS = {"ops_anchor", "L1", "summary", "decision", "fact", "current_state"}
+HIGH_DENSITY_LAYERS = {"ops_anchor", "L1", "summary", "decision", "fact", "current_state", "core_memory"}
 
 
 def _is_operational_query(query: str) -> bool:
@@ -389,6 +389,8 @@ def _memory_quality_multiplier(node: Dict[str, Any]) -> float:
             "fact": 1.18,
         }
         return kind_weights.get(kind, 1.20)
+    if layer == "core_memory" or label == "core_memory":
+        return 1.35
     if layer in {"summary", "decision", "fact", "current_state"}:
         return 1.2
     if layer == "ops_anchor" or source == "magma_operational_anchor":

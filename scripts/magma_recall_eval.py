@@ -1,7 +1,8 @@
-"""Small recall-quality eval set for MAGMA auto-recall relevance.
+"""Recall-quality benchmark for MAGMA.
 
-Scores each question by checking whether expected operational facts appear in
-the top retrieved memories from the live MAGMA API.
+The live recall cases verify that important operational memories are retrieved
+from the running MAGMA API. Local checks cover routing behavior that should not
+depend on the current production database, such as short-command parsing.
 """
 
 import argparse
@@ -12,6 +13,10 @@ import sys
 import urllib.error
 import urllib.request
 from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 
 def _configured_api_base() -> str:
@@ -32,34 +37,40 @@ def _configured_api_base() -> str:
 API_BASE = _configured_api_base()
 
 
-CASES = [
+LIVE_CASES = [
     {
         "id": "mcp_proxy_8902",
+        "category": "ops",
         "query": "MAGMA MCP 为什么要改成 8902 主链路薄代理？",
         "expect_any": ["8902", "mcp_proxy", "http_proxy", "薄代理"],
     },
     {
         "id": "recent_capture_yellow",
+        "category": "ops",
         "query": "MAGMA doctor 的 recent_capture 变成 yellow 是什么意思？系统坏了吗？",
         "expect_any": ["recent_capture", "6h", "6 小时", "yellow", "最近写入"],
     },
     {
         "id": "version_pin_520",
-        "query": "OpenClaw 为什么现在要 pin 在 2026.5.20，不能升 5.22？",
+        "category": "ops",
+        "query": "OpenClaw 为什么之前要 pin 在 2026.5.20，不能升 5.22？",
         "expect_any": ["2026.5.20", "5.22", "版本 pin", "codex"],
     },
     {
         "id": "source_agent_id",
+        "category": "provenance",
         "query": "MAGMA 为什么要把 source_agent_id 正式入库？",
         "expect_any": ["source_agent_id", "department", "跨 agent", "归因"],
     },
     {
         "id": "p0_ops",
+        "category": "ops",
         "query": "MAGMA 的 P0 运维化三件套是什么？",
         "expect_any": ["magma_doctor.py", "magma_ops.py", "RUNBOOK.md", "红黄绿"],
     },
     {
         "id": "yunying_injection",
+        "category": "cross_agent",
         "query": "为什么之前判断 yunying 没有 MAGMA 注入是不完整判断？",
         "expect_any": ["yunying", "source_agents", "source_agent_id", "subagent"],
     },
@@ -111,7 +122,7 @@ def result_text(result: dict) -> str:
     return "\n".join(str(chunk) for chunk in chunks if chunk).lower()
 
 
-def score_case(case: dict, results: list) -> dict:
+def score_live_case(case: dict, results: list) -> dict:
     direct_haystack = "\n".join(direct_result_text(item) for item in results)
     haystack = "\n".join(result_text(item) for item in results)
     direct_matched = [term for term in case["expect_any"] if term.lower() in direct_haystack]
@@ -126,7 +137,9 @@ def score_case(case: dict, results: list) -> dict:
         score = 0
     return {
         "id": case["id"],
+        "category": case.get("category", "live"),
         "score": score,
+        "max_score": 2,
         "matched": matched,
         "direct_matched": direct_matched,
         "top_matched": top_matched,
@@ -135,23 +148,63 @@ def score_case(case: dict, results: list) -> dict:
     }
 
 
+def run_local_checks() -> list:
+    from magma.short_command import is_short_command, normalize_short_command_query
+
+    cases = [
+        {
+            "id": "short_command_timestamp_prefix",
+            "category": "short_command",
+            "ok": is_short_command("[Fri 2026-06-05 19:53 GMT+8] 更新"),
+        },
+        {
+            "id": "short_command_multiline_first_line",
+            "category": "short_command",
+            "ok": normalize_short_command_query("更新\n然后不要总结") == "更新",
+        },
+        {
+            "id": "short_command_rejection",
+            "category": "short_command",
+            "ok": is_short_command("取消"),
+        },
+    ]
+    return [
+        {
+            **case,
+            "score": 1 if case["ok"] else 0,
+            "max_score": 1,
+        }
+        for case in cases
+    ]
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Evaluate MAGMA recall quality.")
     parser.add_argument("--top-k", type=int, default=6)
     parser.add_argument("--json", action="store_true")
+    parser.add_argument("--live-only", action="store_true", help="Skip local routing checks")
     args = parser.parse_args()
 
     reports = []
-    for case in CASES:
+    for case in LIVE_CASES:
         try:
             results = post_query(case["query"], args.top_k)
         except (urllib.error.URLError, TimeoutError) as exc:
-            reports.append({"id": case["id"], "score": 0, "error": str(exc)})
+            reports.append({
+                "id": case["id"],
+                "category": case.get("category", "live"),
+                "score": 0,
+                "max_score": 2,
+                "error": str(exc),
+            })
             continue
-        reports.append(score_case(case, results))
+        reports.append(score_live_case(case, results))
+
+    if not args.live_only:
+        reports.extend(run_local_checks())
 
     total = sum(item.get("score", 0) for item in reports)
-    max_total = len(CASES) * 2
+    max_total = sum(item.get("max_score", 2) for item in reports)
     summary = {
         "total": total,
         "max_total": max_total,
@@ -166,8 +219,13 @@ def main() -> int:
 
     print(f"MAGMA recall eval: {total}/{max_total} ({summary['pct']}%)")
     for item in reports:
-        marker = "OK" if item.get("score") == 2 else "PARTIAL" if item.get("score") == 1 else "MISS"
-        print(f"- {marker} {item['id']}: score={item.get('score')} matched={item.get('matched', [])} top={item.get('top_ids', [])}")
+        max_score = item.get("max_score", 2)
+        marker = "OK" if item.get("score") == max_score else "PARTIAL" if item.get("score") else "MISS"
+        print(
+            f"- {marker} {item['id']} [{item.get('category', 'live')}]: "
+            f"score={item.get('score')}/{max_score} matched={item.get('matched', [])} "
+            f"top={item.get('top_ids', [])}"
+        )
         if item.get("error"):
             print(f"  error={item['error']}")
     return 0 if summary["pass"] else 1

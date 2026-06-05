@@ -1111,6 +1111,73 @@ class SQLiteStore:
         """, tuple(params))
         return [self._row_to_node(r) for r in cur.fetchall()]
 
+    def get_core_memories(self, agent_id: str = None, block_name: str = None) -> List[Dict]:
+        """Return first-class core memory blocks.
+
+        Core memory is the agent's stable working memory: persona, user
+        preferences, project state, operational rules, and current tasks.
+        It is intentionally queried by exact block metadata rather than
+        semantic search so agents can rely on it.
+        """
+        where = [
+            "status = 'active'",
+            "label = 'core_memory'",
+            "json_extract(properties, '$.layer') = 'core_memory'",
+        ]
+        params = []
+        if agent_id:
+            where.append("COALESCE(json_extract(properties, '$.agent_id'), '') = ?")
+            params.append(agent_id)
+        if block_name:
+            where.append("json_extract(properties, '$.block_name') = ?")
+            params.append(block_name)
+        cur = self._conn.execute(f"""
+            SELECT id, label, properties, created_at, updated_at,
+                   last_accessed_at, access_count, importance, ttl_days,
+                   valid_from, valid_until, status, source_agent_id, department
+              FROM nodes
+             WHERE {" AND ".join(where)}
+             ORDER BY
+               CASE json_extract(properties, '$.block_name')
+                 WHEN 'persona' THEN 0
+                 WHEN 'user_preferences' THEN 1
+                 WHEN 'project_state' THEN 2
+                 WHEN 'current_tasks' THEN 3
+                 WHEN 'operational_rules' THEN 4
+                 ELSE 5
+               END,
+               datetime(updated_at) DESC
+        """, tuple(params))
+        return [self._row_to_node(r) for r in cur.fetchall()]
+
+    def set_core_memory(
+        self,
+        block_name: str,
+        content: str,
+        agent_id: str = None,
+        source: str = "agent_self_edit",
+        importance: float = 0.95,
+        embedding=None,
+    ) -> Dict:
+        """Create or update a first-class core memory block."""
+        safe_agent = agent_id or "default"
+        node_id = f"core_memory:{safe_agent}:{block_name}"
+        properties = {
+            "layer": "core_memory",
+            "kind": "core_memory",
+            "block_name": block_name,
+            "content": content,
+            "agent_id": agent_id,
+            "source_agent_id": agent_id,
+            "source": source,
+            "importance": importance,
+            "memory_scope": "system",
+            "ttl_days": None,
+        }
+        self.add_node(node_id, "core_memory", properties, embedding)
+        node = self.get_node(node_id)
+        return node or {"id": node_id, "label": "core_memory", "properties": properties}
+
     def get_fact_timeline(self, entity_name: str, limit: int = 20) -> List[Dict]:
         """Get time-ordered facts about an entity (current + historical)."""
         cur = self._conn.execute("""

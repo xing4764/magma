@@ -141,6 +141,14 @@ class EntitySearchRequest(BaseModel):
     entity_type: Optional[str] = None
 
 
+class CoreMemoryRequest(BaseModel):
+    block_name: str
+    content: str
+    agent_id: Optional[str] = None
+    source: str = "agent_self_edit"
+    importance: float = 0.95
+
+
 class QueryResponse(BaseModel):
     query: str
     results: list
@@ -283,7 +291,7 @@ def create_app() -> FastAPI:
                 "source": "system",
             }]
 
-        # P2: Context Synthesis — generate narrative from graph topology
+        # P2: Context synthesis generates a narrative from graph topology.
         narrative_data = None
         try:
             from magma.context_synthesis import synthesize_narrative
@@ -678,6 +686,47 @@ def create_app() -> FastAPI:
         store = getattr(app.state, "store", None) or get_store()
         results = store.get_active_facts(entity_name=entity_name, category=category, limit=limit)
         return {"facts": results, "count": len(results)}
+
+    @app.get("/api/v1/core_memory")
+    async def get_core_memory(agent_id: str = None, block_name: str = None):
+        from magma.graph.sqlite_store import get_store
+
+        store = getattr(app.state, "store", None) or get_store()
+        blocks = await asyncio.to_thread(
+            store.get_core_memories,
+            agent_id=agent_id,
+            block_name=block_name,
+        )
+        return {"blocks": blocks, "count": len(blocks)}
+
+    @app.put("/api/v1/core_memory")
+    async def set_core_memory(req: CoreMemoryRequest):
+        from magma.graph.sqlite_store import get_store
+        from magma.vector.encoder import Encoder
+
+        store = getattr(app.state, "store", None) or get_store()
+        encoder = getattr(app.state, "encoder", None) or Encoder()
+        text_for_embedding = f"core_memory {req.block_name}: {req.content}"
+        embedding = await asyncio.to_thread(encoder.encode, text_for_embedding)
+        embedding = embedding.astype("float32")
+        node = await asyncio.to_thread(
+            store.set_core_memory,
+            block_name=req.block_name,
+            content=req.content,
+            agent_id=req.agent_id,
+            source=req.source,
+            importance=req.importance,
+            embedding=embedding,
+        )
+
+        faiss_index = getattr(app.state, "faiss_index", None)
+        if faiss_index and embedding is not None:
+            try:
+                await asyncio.to_thread(faiss_index.add, node["id"], embedding)
+            except Exception as e:
+                logger.warning(f"FAISS core memory add failed: {e}")
+
+        return {"status": "ok", "block": node}
 
     # --- P1-1: Entity management endpoints ---
     @app.get("/api/v1/entities")

@@ -1,41 +1,115 @@
 """Short command detection and resolution for MAGMA.
 
-When user sends a short message like "更新", "开始", "继续", "1", "可以",
-it should be resolved against recent conversation context (pending decisions,
-open questions) rather than treated as a standalone semantic query.
-
-Expected flow:
-  short command → recent context anchor → pending decision/task_intent →
-  L1 decision node priority → L0 evidence supplement → execute action
+Short confirmations such as "更新", "继续", "开始", "可以", "1", or
+"ok" are not meaningful semantic queries by themselves. MAGMA resolves them
+against the most recent scoped conversation context, preferring explicit L1
+decisions, assistant questions, and fact:action nodes.
 """
 
 import logging
 import re
-from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger("magma.short_command")
 
-# Short command patterns (Chinese + English)
-SHORT_COMMAND_PATTERNS = [
-    # Confirmation/agreement
-    r"^(好|行|可以|没问题|ok|yes|确认|确定|对|嗯|搞吧|弄吧|上|干吧|整)$",
-    r"^(好的|行的|可以的|没问题的|对的)$",
-    # Action triggers
-    r"^(更新|开始|继续|执行|运行|启动|停止|取消|重试|跳过|结束|完成)$",
-    r"^(update|start|continue|run|go|stop|cancel|retry|skip|done|finish)$",
-    # Numeric selection
-    r"^[1-9]\d{0,2}$",
-    # Single character confirmations
-    r"^[yYnN]$",
-    # Short phrases (<=3 chars that are likely confirmations)
-    r"^.{1,2}$",
-]
-
-_COMPILED_PATTERNS = [re.compile(p, re.IGNORECASE) for p in SHORT_COMMAND_PATTERNS]
-
-# Maximum length to be considered a short command
 MAX_SHORT_COMMAND_LENGTH = 6
+
+CONFIRMATION_WORDS = {
+    "好",
+    "行",
+    "可以",
+    "没问题",
+    "确定",
+    "确认",
+    "对",
+    "嗯",
+    "搞吧",
+    "弄吧",
+    "干吧",
+    "更新",
+    "开始",
+    "继续",
+    "执行",
+    "运行",
+    "启动",
+    "完成",
+    "ok",
+    "yes",
+    "y",
+    "go",
+    "run",
+    "start",
+    "continue",
+    "update",
+    "done",
+    "finish",
+    "1",
+}
+
+REJECTION_WORDS = {
+    "不",
+    "不要",
+    "算了",
+    "取消",
+    "停止",
+    "跳过",
+    "no",
+    "n",
+    "stop",
+    "cancel",
+    "skip",
+}
+
+ACTION_WORDS = {
+    "更新",
+    "开始",
+    "继续",
+    "执行",
+    "运行",
+    "启动",
+    "重试",
+    "结束",
+    "完成",
+    "update",
+    "start",
+    "continue",
+    "run",
+    "retry",
+    "finish",
+}
+
+DIAGNOSTIC_MARKERS = (
+    "验收结果",
+    "检查项",
+    "根因",
+    "结论",
+    "发现问题",
+    "问题链",
+    "short_command",
+    "extract_pending_action",
+    "drift_warning",
+    "magma-recall.jsonl",
+    "API 返回",
+    "Codex 已",
+)
+
+QUESTION_INDICATORS = (
+    "需要我",
+    "要我",
+    "要不",
+    "是否",
+    "你想",
+    "你要",
+    "帮你",
+    "吗？",
+    "吗",
+    "?",
+    "？",
+)
+
+QUESTION_ACTION_RE = re.compile(
+    r"(?:需要我|要我|帮你|是否)(.*?)(?:吗|么|\?|\？|$)"
+)
 
 
 def normalize_short_command_query(query: str) -> str:
@@ -48,13 +122,13 @@ def normalize_short_command_query(query: str) -> str:
         return ""
 
     lines = [line.strip() for line in q.splitlines() if line.strip()]
-
-    # OpenClaw may prepend recovery notes before the actual user message.
     while lines and lines[0].startswith("Note:"):
         lines.pop(0)
     if not lines:
         return ""
 
+    # Use the first user line. Later lines are often test instructions, not
+    # the short command itself.
     q = lines[0]
 
     # OpenClaw prompt text commonly arrives as:
@@ -67,115 +141,32 @@ def normalize_short_command_query(query: str) -> str:
 
 
 def is_short_command(query: str) -> bool:
-    """Detect if a query is a short command that needs context resolution.
-
-    A short command is:
-    - Very short (<= MAX_SHORT_COMMAND_LENGTH chars)
-    - Matches known short command patterns
-    - Not a meaningful semantic query on its own
-    """
-    if not query or not query.strip():
-        return False
-
+    """Return True when a query should be resolved against recent context."""
     q = normalize_short_command_query(query)
-
-    # Too long to be a short command
-    if len(q) > MAX_SHORT_COMMAND_LENGTH:
+    if not q or len(q) > MAX_SHORT_COMMAND_LENGTH:
         return False
+    lowered = q.lower()
+    if lowered in CONFIRMATION_WORDS or lowered in REJECTION_WORDS or lowered in ACTION_WORDS:
+        return True
+    if re.fullmatch(r"[1-9]\d{0,2}", q):
+        return True
+    if re.fullmatch(r"[yYnN]", q):
+        return True
+    # Very short Chinese replies are usually confirmations in this route.
+    return len(q) <= 2
 
-    # Check against patterns
-    for pattern in _COMPILED_PATTERNS:
-        if pattern.match(q):
-            return True
 
-    return False
+def _content(node: Dict[str, Any]) -> str:
+    props = node.get("properties") or {}
+    return str(props.get("content") or props.get("summary") or props.get("message") or "")
 
 
-def extract_pending_action(recent_nodes: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    """Extract the most recent pending action/question from recent conversation.
-
-    Looks for:
-    1. L1 decision/task_intent nodes
-    2. Assistant questions (ending with ?/？)
-    3. Recent L0 events that suggest a pending action
-
-    Returns the best candidate pending action node, or None.
-    """
-    if not recent_nodes:
-        return None
-
-    newest_first = list(reversed(recent_nodes))
-
-    # Priority 1: L1 decision/task_intent nodes (most reliable)
-    for node in newest_first:
-        props = node.get("properties") or {}
-        layer = props.get("layer")
-        kind = props.get("kind")
-        if layer == "L1" and kind in ("decision", "task_intent"):
-            return {
-                "node": node,
-                "source": "l1_decision",
-                "confidence": 0.95,
-                "action_hint": props.get("content") or props.get("summary") or "",
-            }
-
-    # Priority 2: Assistant messages with questions (pending question)
-    for node in newest_first:
-        props = node.get("properties") or {}
-        role = props.get("role")
-        content = str(props.get("content") or props.get("message") or "")
-        if role == "assistant" and content:
-            # Check if it contains a question directed at the user
-            question_indicators = ("需要我", "要我", "要不", "是否", "你想", "你要", "帮你", "吗？", "吗?", "?", "？")
-            if any(indicator in content for indicator in question_indicators):
-                # Extract the action from the question
-                action_match = re.search(
-                    r"(?:需要我|要我|帮你|是否)(.*?)(?:吗|吧|\?|？|$)",
-                    content
-                )
-                action_hint = action_match.group(1).strip() if action_match else content[:100]
-                return {
-                    "node": node,
-                    "source": "assistant_question",
-                    "confidence": 0.85,
-                    "action_hint": action_hint,
-                }
-
-    # Priority 3: Recent L0 events mentioning pending actions
-    for node in newest_first[:6]:  # Only check the freshest context
-        props = node.get("properties") or {}
-        content = str(props.get("content") or props.get("message") or "")
-        layer = props.get("layer")
-        role = props.get("role")
-        node_id = str(node.get("id") or "")
-        if layer == "L0" and content:
-            if role == "fact" and node_id.startswith("fact:action:"):
-                return {
-                    "node": node,
-                    "source": "fact_action",
-                    "confidence": 0.75,
-                    "action_hint": content[:100],
-                }
-            # Check if the content suggests a pending action
-            pending_keywords = ("需要", "准备", "打算", "计划", "待", "pending", "todo")
-            if any(kw in content.lower() for kw in pending_keywords):
-                return {
-                    "node": node,
-                    "source": "l0_pending",
-                    "confidence": 0.6,
-                    "action_hint": content[:100],
-                }
-
-    return None
+def _is_diagnostic(content: str) -> bool:
+    return any(marker in content for marker in DIAGNOSTIC_MARKERS)
 
 
 def extract_pending_action(recent_nodes: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    """Extract a pending action while ignoring diagnostic graph fragments.
-
-    The fallback must not bind to fact/cause/effect troubleshooting notes just
-    because they contain words like "pending" or "need". Short confirmations
-    should bind to the latest real assistant question or explicit fact:action.
-    """
+    """Extract the best pending action while ignoring diagnostic fragments."""
     if not recent_nodes:
         return None
 
@@ -183,92 +174,8 @@ def extract_pending_action(recent_nodes: List[Dict[str, Any]]) -> Optional[Dict[
 
     for node in newest_first:
         props = node.get("properties") or {}
-        if props.get("layer") == "L1" and props.get("kind") in ("decision", "task_intent"):
-            return {
-                "node": node,
-                "source": "l1_decision",
-                "confidence": 0.95,
-                "action_hint": props.get("content") or props.get("summary") or "",
-            }
-
-    event_nodes = [
-        node for node in newest_first
-        if node.get("label") == "event"
-        and (node.get("properties") or {}).get("role") in ("assistant", "user")
-    ]
-
-    question_indicators = (
-        "\u9700\u8981\u6211", "\u8981\u6211", "\u8981\u4e0d", "\u662f\u5426",
-        "\u4f60\u60f3", "\u4f60\u8981", "\u5e2e\u4f60", "\u5417\uff1f", "\u5417",
-        "?", "\uff1f",
-        "闇€瑕佹垜", "瑕佹垜", "瑕佷笉", "鏄惁", "浣犳兂", "浣犺", "甯綘", "鍚楋紵", "鍚?",
-    )
-    question_re = re.compile(
-        r"(?:\u9700\u8981\u6211|\u8981\u6211|\u5e2e\u4f60|\u662f\u5426|"
-        r"闇€瑕佹垜|瑕佹垜|甯綘|鏄惁)(.*?)(?:\u5417|\u55ce|\u4e48|\u9ebc|\?|\uff1f|鍚梶鍚\?|锛焲$)"
-    )
-    for node in event_nodes:
-        props = node.get("properties") or {}
-        content = str(props.get("content") or props.get("message") or "")
-        if props.get("role") == "assistant" and content and any(ind in content for ind in question_indicators):
-            match = question_re.search(content)
-            return {
-                "node": node,
-                "source": "assistant_question",
-                "confidence": 0.85,
-                "action_hint": match.group(1).strip() if match else content[:100],
-            }
-
-    for node in newest_first:
-        props = node.get("properties") or {}
-        content = str(props.get("content") or props.get("message") or "")
-        node_id = str(node.get("id") or "")
-        if props.get("layer") == "L0" and props.get("role") == "fact" and node_id.startswith("fact:action:"):
-            return {
-                "node": node,
-                "source": "fact_action",
-                "confidence": 0.75,
-                "action_hint": content[:100],
-            }
-
-    pending_keywords = (
-        "\u9700\u8981", "\u51c6\u5907", "\u6253\u7b97", "\u8ba1\u5212", "\u5f85",
-        "pending", "todo",
-    )
-    for node in event_nodes[:10]:
-        props = node.get("properties") or {}
-        content = str(props.get("content") or props.get("message") or "")
-        if props.get("layer") == "L0" and content and any(kw in content.lower() for kw in pending_keywords):
-            return {
-                "node": node,
-                "source": "l0_pending",
-                "confidence": 0.6,
-                "action_hint": content[:100],
-            }
-
-    return None
-
-
-def extract_pending_action(recent_nodes: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    """Strict pending-action resolver for short confirmations."""
-    if not recent_nodes:
-        return None
-
-    newest_first = list(reversed(recent_nodes))
-    diagnostic_markers = (
-        "\u9a8c\u6536\u7ed3\u679c", "\u68c0\u67e5\u9879", "\u6839\u56e0",
-        "\u7ed3\u8bba", "\u53d1\u73b0\u95ee\u9898", "\u95ee\u9898\u94fe",
-        "short_command", "extract_pending_action", "drift_warning",
-        "magma-recall.jsonl", "API \u8fd4\u56de", "Codex \u5df2",
-    )
-
-    def is_diagnostic(content: str) -> bool:
-        return any(marker in content for marker in diagnostic_markers)
-
-    for node in newest_first:
-        props = node.get("properties") or {}
-        content = str(props.get("content") or props.get("summary") or "")
-        if is_diagnostic(content):
+        content = _content(node)
+        if _is_diagnostic(content):
             continue
         if props.get("layer") == "L1" and props.get("kind") in ("decision", "task_intent"):
             return {
@@ -284,22 +191,13 @@ def extract_pending_action(recent_nodes: List[Dict[str, Any]]) -> Optional[Dict[
         and (node.get("properties") or {}).get("role") in ("assistant", "user")
     ]
 
-    question_indicators = (
-        "\u9700\u8981\u6211", "\u8981\u6211", "\u8981\u4e0d", "\u662f\u5426",
-        "\u4f60\u60f3", "\u4f60\u8981", "\u5e2e\u4f60", "\u5417\uff1f", "\u5417",
-        "?", "\uff1f",
-    )
-    question_re = re.compile(
-        r"(?:\u9700\u8981\u6211|\u8981\u6211|\u5e2e\u4f60|\u662f\u5426)"
-        r"(.*?)(?:\u5417|\u55ce|\u4e48|\u9ebc|\?|\uff1f|$)"
-    )
     for node in event_nodes:
         props = node.get("properties") or {}
-        content = str(props.get("content") or props.get("message") or "")
-        if is_diagnostic(content):
+        content = _content(node)
+        if _is_diagnostic(content):
             continue
-        if props.get("role") == "assistant" and any(ind in content for ind in question_indicators):
-            match = question_re.search(content)
+        if props.get("role") == "assistant" and any(ind in content for ind in QUESTION_INDICATORS):
+            match = QUESTION_ACTION_RE.search(content)
             return {
                 "node": node,
                 "source": "assistant_question",
@@ -309,9 +207,9 @@ def extract_pending_action(recent_nodes: List[Dict[str, Any]]) -> Optional[Dict[
 
     for node in newest_first:
         props = node.get("properties") or {}
-        content = str(props.get("content") or props.get("message") or "")
+        content = _content(node)
         node_id = str(node.get("id") or "")
-        if is_diagnostic(content):
+        if _is_diagnostic(content):
             continue
         if props.get("layer") == "L0" and props.get("role") == "fact" and node_id.startswith("fact:action:"):
             return {
@@ -321,14 +219,11 @@ def extract_pending_action(recent_nodes: List[Dict[str, Any]]) -> Optional[Dict[
                 "action_hint": content[:100],
             }
 
-    pending_keywords = (
-        "\u9700\u8981", "\u51c6\u5907", "\u6253\u7b97", "\u8ba1\u5212", "\u5f85",
-        "pending", "todo",
-    )
+    pending_keywords = ("需要", "准备", "打算", "计划", "待", "pending", "todo")
     for node in event_nodes[:10]:
         props = node.get("properties") or {}
-        content = str(props.get("content") or props.get("message") or "")
-        if is_diagnostic(content):
+        content = _content(node)
+        if _is_diagnostic(content):
             continue
         if props.get("layer") == "L0" and any(kw in content.lower() for kw in pending_keywords):
             return {
@@ -346,61 +241,34 @@ def resolve_short_command(
     recent_nodes: List[Dict[str, Any]],
     store=None,
 ) -> Optional[Dict[str, Any]]:
-    """Resolve a short command against recent conversation context.
-
-    Returns:
-        Dict with resolution result, or None if no context found.
-        {
-            "resolved": True,
-            "pending_action": {...},  # The pending action being confirmed
-            "context_nodes": [...],   # Relevant context nodes
-            "confidence": float,      # How confident we are in the resolution
-            "suggested_action": str,  # What action should be taken
-        }
-    """
+    """Resolve a short command against scoped recent conversation context."""
     command = normalize_short_command_query(query)
     if not is_short_command(command):
         return None
 
     pending = extract_pending_action(recent_nodes)
     if not pending:
-        logger.info(f"Short command '{command}' detected but no pending action found in recent context")
+        logger.info("Short command '%s' detected but no pending action found", command)
         return None
 
-    # Determine if the short command is a confirmation or rejection
     q = command.strip().lower()
-    confirmation_words = {
-        "好", "行", "可以", "没问题", "ok", "yes", "确认", "确定", "对", "嗯",
-        "搞吧", "弄吧", "上", "干吧", "整", "好的", "行的", "可以的",
-        "y", "1", "继续", "更新", "开始", "执行", "运行", "启动",
-    }
-    rejection_words = {
-        "不", "不要", "算了", "取消", "no", "n", "停", "停止", "跳过",
-    }
-
-    is_confirm = q in confirmation_words
-    is_reject = q in rejection_words
-
-    if not is_confirm and not is_reject:
-        # Default to confirmation for ambiguous short commands
-        is_confirm = True
-
-    # Build context nodes list (the pending action + its evidence chain)
+    is_reject = q in REJECTION_WORDS
+    is_confirm = not is_reject
     context_nodes = [pending["node"]]
 
-    # Try to find the L0 evidence that led to this pending action
     if store and pending["node"].get("id"):
         try:
             edges = store.get_edges(pending["node"]["id"])
             for edge in edges:
-                if edge.get("relation") == "responded_by":
-                    source_id = edge.get("source_id") or edge.get("target_id")
-                    if source_id and source_id != pending["node"]["id"]:
-                        evidence_node = store.get_node(source_id)
-                        if evidence_node:
-                            context_nodes.append(evidence_node)
-        except Exception as e:
-            logger.warning(f"Failed to fetch evidence chain: {e}")
+                if edge.get("relation") != "responded_by":
+                    continue
+                source_id = edge.get("source_id") or edge.get("target_id")
+                if source_id and source_id != pending["node"]["id"]:
+                    evidence_node = store.get_node(source_id)
+                    if evidence_node:
+                        context_nodes.append(evidence_node)
+        except Exception as exc:
+            logger.warning("Failed to fetch short-command evidence chain: %s", exc)
 
     return {
         "resolved": True,
@@ -416,16 +284,11 @@ def resolve_short_command(
 
 
 def build_short_command_response(resolution: Dict[str, Any]) -> Dict[str, Any]:
-    """Build a response structure for short command resolution.
-
-    This is used to provide context to the caller about what was resolved.
-    """
+    """Build a serializable explanation of a short-command resolution."""
     if not resolution:
         return {}
 
     pending = resolution.get("pending_action") or {}
-    node = pending.get("node") or {}
-
     return {
         "short_command_resolution": {
             "original_query": resolution.get("query"),
