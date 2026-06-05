@@ -868,7 +868,9 @@ class MemorySearcher:
         # When query is a short command (e.g., "更新", "开始", "可以"),
         # resolve it against recent conversation context first.
         short_cmd_result = None
-        if is_short_command(query):
+        _is_short = is_short_command(query)
+        logger.info(f"[DEBUG] is_short_command('{query}') = {_is_short}")
+        if _is_short:
             # Get recent conversation nodes for context
             recent_nodes = []
             try:
@@ -1108,13 +1110,13 @@ class MemorySearcher:
                         f"score {original:.4f} -> {item['score']:.4f}"
                     )
 
-            # Also inject resolution metadata into the first result
+            results.sort(key=lambda item: item["score"], reverse=True)
+
+            # Inject resolution metadata into the first result AFTER re-sort
             if results and short_cmd_resolution.get("is_confirmation"):
                 results[0]["short_command_resolution"] = build_short_command_response(
                     short_cmd_resolution
                 )
-
-            results.sort(key=lambda item: item["score"], reverse=True)
 
         # --- P0: Graph Walk Engine (HippoRAG-style) ---
         # Take top-K candidates from FAISS+keyword scoring, walk 2 hops on graph
