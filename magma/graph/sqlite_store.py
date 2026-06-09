@@ -125,6 +125,7 @@ class SQLiteStore:
         feedback_columns = {
             "source_agent_id": "TEXT",
             "department": "TEXT",
+            "missed": "TEXT DEFAULT '[]'",
         }
         for name, definition in feedback_columns.items():
             if name not in feedback_existing:
@@ -456,14 +457,23 @@ class SQLiteStore:
         unused_delta: float = -0.004,
         source_agent_id: str = None,
         department: str = None,
+        missed_node_ids: List[str] = None,
     ) -> Dict[str, Any]:
         recalled = list(dict.fromkeys(recalled_node_ids or []))
         used = set(used_node_ids or [])
+        missed = set(missed_node_ids or [])
         updates = []
         with self._write_lock:
             for node_id in recalled:
-                signal = "used" if node_id in used else "unused"
-                delta = positive_delta if signal == "used" else unused_delta
+                if node_id in missed:
+                    signal = "missed"
+                    delta = 0.0  # No importance change for missed nodes (protection)
+                elif node_id in used:
+                    signal = "used"
+                    delta = positive_delta
+                else:
+                    signal = "unused"
+                    delta = unused_delta
                 cur = self._conn.execute("SELECT importance FROM nodes WHERE id = ?", (node_id,))
                 row = cur.fetchone()
                 if not row:
@@ -482,10 +492,11 @@ class SQLiteStore:
                 )
                 self._conn.execute(
                     """
-                    INSERT INTO recall_feedback (event_id, node_id, signal, delta, old_importance, new_importance, source_agent_id, department)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO recall_feedback (event_id, node_id, signal, delta, old_importance, new_importance, source_agent_id, department, missed)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
-                    (event_id, node_id, signal, delta, old, new, source_agent_id, department)
+                    (event_id, node_id, signal, delta, old, new, source_agent_id, department,
+                     json.dumps(sorted(missed), ensure_ascii=False) if node_id in missed else '[]')
                 )
                 updates.append({
                     "node_id": node_id,
@@ -508,6 +519,7 @@ class SQLiteStore:
             "event_id": event_id,
             "recalled": len(recalled),
             "used": len(used),
+            "missed": len(missed),
             "updates": updates,
         }
 

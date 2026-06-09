@@ -6,6 +6,8 @@ import json
 import logging
 import os
 import sys
+import time
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -19,6 +21,14 @@ from pydantic import BaseModel
 os.environ.setdefault("HF_ENDPOINT", "https://huggingface.co")
 
 logger = logging.getLogger("magma.api")
+
+# --- P0-2: Importance label helpers ---
+IMPORTANCE_LABEL_MAP = {
+    "critical": 0.95,
+    "useful": 0.75,
+    "reference": 0.45,
+    "noise": 0.15,
+}
 
 
 # Lazy-import fact extractor to avoid cold-start on import
@@ -111,6 +121,7 @@ class QueryRequest(BaseModel):
     query: str
     top_k: int = 5
     filters: Optional[dict] = None
+    priority: str = "normal"  # P2-6: "critical" | "normal" | "low"
 
 
 class NodeRequest(BaseModel):
@@ -158,7 +169,13 @@ class QueryResponse(BaseModel):
     references: Optional[list] = None
     token_budget: Optional[int] = None
     tokens_used: Optional[int] = None
+    token_usage_ratio: Optional[float] = None
+    budget_warning: Optional[str] = None  # P2-6: low-priority budget warning
+    backtrack_warning: Optional[bool] = None  # P2-5: backtrack detection
+    backtrack_narrative: Optional[str] = None  # P2-5: backtrack suggestion
     short_command_resolution: Optional[dict] = None
+    active_context: Optional[list] = None
+    bridge_entities: Optional[list] = None
 
 
 class FeedbackRequest(BaseModel):
@@ -168,6 +185,7 @@ class FeedbackRequest(BaseModel):
     session_key: Optional[str] = None
     recalled: list = []
     used: list = []
+    missed_node_ids: list = []
     positive_delta: float = 0.05
     unused_delta: float = -0.01
 
@@ -192,11 +210,78 @@ class SuppressPatternRequest(BaseModel):
     ttl_days: Optional[int] = None
 
 
+class VerifyRequest(BaseModel):
+    node_ids: list
+    claim: str
+
+
 class L1DistillRequest(BaseModel):
     hours: int = 24
     limit: int = 200
     dry_run: bool = False
     source_agent_id: Optional[str] = None
+
+
+def _verify_with_llm(claim: str, node_contents: list) -> dict:
+    """Verify claim against node contents using LLM (DeepSeek via OpenRouter)."""
+    import httpx
+
+    # Build evidence text
+    evidence_parts = []
+    for nc in node_contents:
+        evidence_parts.append(f"[{nc['id']}] ({nc['label']}): {nc['content']}")
+    evidence_text = "\n".join(evidence_parts)
+
+    prompt = f"""You are a fact-checker. Verify whether the following claim is supported by the provided evidence.
+
+Claim: {claim}
+
+Evidence:
+{evidence_text}
+
+Respond in JSON format:
+{{
+  "verdict": "supported" | "unsupported" | "partial",
+  "evidence": "<brief explanation of what supports or contradicts the claim>",
+  "confidence": <0.0 to 1.0>
+}}"""
+
+    api_key = os.environ.get("OPENROUTER_API_KEY", os.environ.get("OPENAI_API_KEY", ""))
+    base_url = os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+    model = os.environ.get("MAGMA_VERIFY_MODEL", "deepseek/deepseek-chat")
+
+    if not api_key:
+        return {"verdict": "unsupported", "evidence": "No API key configured for verification.", "confidence": 0.0}
+
+    try:
+        with httpx.Client(timeout=30) as client:
+            resp = client.post(
+                f"{base_url}/chat/completions",
+                headers={"Authorization": f"Bearer {api_key}"},
+                json={
+                    "model": model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0.1,
+                    "max_tokens": 500,
+                },
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            content = data["choices"][0]["message"]["content"]
+
+            # Parse JSON from response
+            import re as _re
+            json_match = _re.search(r'\{[^}]+\}', content, _re.DOTALL)
+            if json_match:
+                result = json.loads(json_match.group())
+                return {
+                    "verdict": result.get("verdict", "unsupported"),
+                    "evidence": result.get("evidence", ""),
+                    "confidence": float(result.get("confidence", 0.0)),
+                }
+            return {"verdict": "unsupported", "evidence": "Could not parse LLM response.", "confidence": 0.0}
+    except Exception as e:
+        return {"verdict": "unsupported", "evidence": f"LLM call error: {e}", "confidence": 0.0}
 
 
 def create_app() -> FastAPI:
@@ -323,7 +408,7 @@ def create_app() -> FastAPI:
         try:
             from magma.context_synthesis import synthesize_narrative
             narrative_data = await asyncio.to_thread(
-                synthesize_narrative, results, req.query, intent, store
+                synthesize_narrative, results, req.query, intent, store, req.priority
             )
         except Exception as e:
             logger.warning(f"Context synthesis failed (non-fatal): {e}")
@@ -340,6 +425,37 @@ def create_app() -> FastAPI:
                 if short_cmd_resolution:
                     short_cmd_resolution["drift_warning"] = results[0].get("short_command_drift_warning", False)
 
+        # P1-4: Extract active_context (curated set) from results
+        active_context = [
+            {"id": r["id"], "label": r.get("label", ""), "score": r.get("score", 0),
+             "full_content": r.get("full_content", ""), "tier": r.get("tier", "full")}
+            for r in results if r.get("curated")
+        ]
+
+        # P1-5: Extract bridge_entities from results
+        bridge_entities = []
+        if results:
+            # Collect bridge entities from score_breakdown of first result
+            first_breakdown = (results[0].get("score_breakdown") or {}) if results else {}
+            bridge_count = first_breakdown.get("bridge_entity_count", 0)
+            if bridge_count > 0:
+                # Reconstruct bridge entities from all results
+                ent_map = {}
+                for r in results:
+                    props = r.get("properties", {}) or {}
+                    entities = props.get("entities", [])
+                    if isinstance(entities, list):
+                        for ent in entities:
+                            if isinstance(ent, dict) and ent.get("name"):
+                                ename = ent["name"].lower()
+                                if ename not in ent_map:
+                                    ent_map[ename] = set()
+                                ent_map[ename].add(r["id"])
+                bridge_entities = [
+                    {"entity": name, "node_count": len(nids)}
+                    for name, nids in ent_map.items() if len(nids) >= 2
+                ]
+
         return QueryResponse(
             query=req.query,
             results=results,
@@ -349,7 +465,14 @@ def create_app() -> FastAPI:
             references=narrative_data.get("references") if narrative_data else None,
             token_budget=narrative_data.get("token_budget") if narrative_data else None,
             tokens_used=narrative_data.get("tokens_used") if narrative_data else None,
+            token_usage_ratio=narrative_data.get("token_usage_ratio") if narrative_data else None,
+            budget_warning=narrative_data.get("budget_warning") if narrative_data else None,
+            # P2-5: Backtrack detection from search results
+            backtrack_warning=results[0].get("backtrack_warning") if results else None,
+            backtrack_narrative=results[0].get("backtrack_narrative") if results else None,
             short_command_resolution=short_cmd_resolution,
+            active_context=active_context or None,
+            bridge_entities=bridge_entities or None,
         )
 
     @app.post("/api/v1/nodes")
@@ -382,7 +505,7 @@ def create_app() -> FastAPI:
     async def capture(req: CaptureRequest):
         from magma.graph.sqlite_store import get_store
         from magma.vector.encoder import Encoder
-        from magma.capture_policy import classify_capture
+        from magma.capture_policy import classify_capture, deduplicator, MAGMA_FEATURE_CONTENT_DEDUP
 
         store = getattr(app.state, "store", None) or get_store()
         encoder = getattr(app.state, "encoder", None) or Encoder()
@@ -404,6 +527,39 @@ def create_app() -> FastAPI:
                     "reasons": capture_decision.reasons,
                 },
             }
+
+        # --- P1-1: Content Dedup (MinHash) ---
+        # Check if combined content is a near-duplicate of recent nodes
+        if MAGMA_FEATURE_CONTENT_DEDUP:
+            combined_text = " ".join(t for t in (req.user_text, req.assistant_text) if t and t.strip())
+            if combined_text:
+                t0 = time.time()
+                dup_node_id = deduplicator.is_duplicate(combined_text, store)
+                dedup_ms = (time.time() - t0) * 1000
+                logger.info(f"Dedup check: {dedup_ms:.1f}ms, duplicate={dup_node_id}")
+                if dup_node_id and dedup_ms < 50:
+                    # Merge: update content + access_count on existing node
+                    try:
+                        existing_node = store.get_node(dup_node_id)
+                        if existing_node:
+                            props = dict(existing_node.get("properties", {}) or {})
+                            props["content"] = combined_text
+                            props["access_count"] = int(props.get("access_count", 0)) + 1
+                            props["last_dedup_merge"] = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+                            store.update_node(dup_node_id, props)
+                            return {
+                                "status": "merged",
+                                "written": [dup_node_id],
+                                "count": 1,
+                                "dedup": True,
+                                "dedup_ms": round(dedup_ms, 1),
+                                "capture_decision": {
+                                    "strength": capture_decision.strength,
+                                    "reasons": capture_decision.reasons,
+                                },
+                            }
+                    except Exception as e:
+                        logger.warning(f"Dedup merge failed (falling through to normal capture): {e}")
 
         for role, text in (("user", req.user_text), ("assistant", req.assistant_text)):
             cleaned = (text or "").strip()
@@ -625,11 +781,21 @@ def create_app() -> FastAPI:
         return {"status": "ok"}
 
     @app.get("/api/v1/nodes")
-    async def list_nodes(label: Optional[str] = None, limit: int = 100):
+    async def list_nodes(label: Optional[str] = None, limit: int = 100, importance_label: Optional[str] = None):
         from magma.graph.sqlite_store import get_store
+        from magma.search import importance_label_from_value
 
         store = getattr(app.state, "store", None) or get_store()
-        nodes = store.query_nodes(label=label, limit=limit)
+        nodes = store.query_nodes(label=label, limit=limit * 3 if importance_label else limit)
+        # P0-2: Filter by importance_label if specified
+        if importance_label:
+            nodes = [
+                n for n in nodes
+                if importance_label_from_value(float(n.get("importance") or 0.5)) == importance_label
+            ][:limit]
+        # Attach importance_label to each node
+        for n in nodes:
+            n["importance_label"] = importance_label_from_value(float(n.get("importance") or 0.5))
         return {"nodes": nodes, "count": len(nodes)}
 
     @app.get("/api/v1/nodes/{node_id}")
@@ -652,6 +818,12 @@ def create_app() -> FastAPI:
         encoder = getattr(app.state, "encoder", None) or Encoder()
         # Accept both {"properties": {...}} and flat {...}
         properties = body.get("properties", body)
+
+        # P0-2: Map importance_label to importance value if provided
+        importance_label = properties.pop("importance_label", None)
+        if importance_label and importance_label in IMPORTANCE_LABEL_MAP:
+            properties["importance"] = IMPORTANCE_LABEL_MAP[importance_label]
+            properties["importance_label"] = importance_label
 
         # Check if content-affecting fields changed -> re-encode embedding
         new_embedding = None
@@ -871,6 +1043,7 @@ def create_app() -> FastAPI:
             unused_delta=req.unused_delta,
             source_agent_id=source_agent,
             department=dept,
+            missed_node_ids=req.missed_node_ids,
         )
         return {"status": "ok", "feedback": stats}
 
@@ -933,6 +1106,69 @@ def create_app() -> FastAPI:
             agent_id=req.agent_id,
             ttl_days=req.ttl_days,
         )
+
+    # --- P1-3: Verify endpoint ---
+    # Simple LRU cache for verify results (claim+node_ids -> result, 1h TTL)
+    _verify_cache: Dict[str, tuple] = {}  # key -> (result, timestamp)
+    _VERIFY_CACHE_TTL = 3600  # 1 hour
+
+    @app.post("/api/v1/verify")
+    async def verify(req: VerifyRequest):
+        """Verify a claim against specified memory nodes using LLM.
+
+        Returns: {verdict, evidence, confidence}
+        """
+        import hashlib as _hashlib
+        import time as _time
+
+        # Cache key: sorted node_ids + claim hash
+        cache_key = _hashlib.sha256(
+            f"{sorted(req.node_ids)}:{req.claim}".encode()
+        ).hexdigest()[:16]
+
+        # Check cache
+        cached = _verify_cache.get(cache_key)
+        if cached:
+            result, ts = cached
+            if _time.time() - ts < _VERIFY_CACHE_TTL:
+                return {"status": "ok", "cached": True, **result}
+
+        from magma.graph.sqlite_store import get_store
+        store = getattr(app.state, "store", None) or get_store()
+
+        # Fetch node contents
+        node_contents = []
+        for nid in req.node_ids:
+            node = store.get_node(nid)
+            if node:
+                props = node.get("properties", {}) or {}
+                content = props.get("content", "") or props.get("summary", "") or ""
+                node_contents.append({
+                    "id": nid,
+                    "label": node.get("label", ""),
+                    "content": content[:2000],  # Truncate for LLM context
+                })
+
+        if not node_contents:
+            return {"status": "ok", "verdict": "unsupported", "evidence": "No valid nodes found.", "confidence": 0.0}
+
+        # Call LLM for verification
+        try:
+            result = await asyncio.to_thread(_verify_with_llm, req.claim, node_contents)
+        except Exception as e:
+            logger.warning(f"Verify LLM call failed: {e}")
+            result = {"verdict": "unsupported", "evidence": f"LLM verification failed: {e}", "confidence": 0.0}
+
+        # Cache result
+        _verify_cache[cache_key] = (result, _time.time())
+        # Evict old entries (simple cleanup)
+        if len(_verify_cache) > 1000:
+            cutoff = _time.time() - _VERIFY_CACHE_TTL
+            to_delete = [k for k, (_, ts) in _verify_cache.items() if ts < cutoff]
+            for k in to_delete[:500]:
+                _verify_cache.pop(k, None)
+
+        return {"status": "ok", "cached": False, **result}
 
     return app
 

@@ -39,6 +39,27 @@ API_BASE = _configured_api_base()
 
 LIVE_CASES = [
     {
+        "id": "openclaw_version_guardrail_latest",
+        "category": "ops_regression",
+        "query": "看一下 OpenClaw 最新测试版能不能升级？",
+        "expect_any": ["OpenClaw version questions", "MAGMA first", "npm/GitHub", "5.28", "6.1"],
+        "require_top_id": "ops:openclaw:version-pin-2026-5-20",
+    },
+    {
+        "id": "openclaw_version_guardrail_528",
+        "category": "ops_regression",
+        "query": "我们用的 5.28？",
+        "expect_any": ["OpenClaw version questions", "MAGMA first", "npm/GitHub", "5.28", "6.1"],
+        "require_top_id": "ops:openclaw:version-pin-2026-5-20",
+    },
+    {
+        "id": "openclaw_version_guardrail_61",
+        "category": "ops_regression",
+        "query": "OpenClaw 6.1 能不能升级？",
+        "expect_any": ["OpenClaw version questions", "MAGMA first", "npm/GitHub", "5.28", "6.1"],
+        "require_top_id": "ops:openclaw:version-pin-2026-5-20",
+    },
+    {
         "id": "mcp_proxy_8902",
         "category": "ops",
         "query": "MAGMA MCP 为什么要改成 8902 主链路薄代理？",
@@ -82,6 +103,8 @@ def post_query(query: str, top_k: int) -> list:
         "query": query,
         "top_k": top_k,
         "filters": {
+            "agent_id": "zhuli",
+            "current_agent_id": "zhuli",
             "include_related": True,
             "related_limit": 2,
             "include_versions": True,
@@ -129,7 +152,11 @@ def score_live_case(case: dict, results: list) -> dict:
     matched = [term for term in case["expect_any"] if term.lower() in haystack]
     top_text = result_text(results[0]) if results else ""
     top_matched = [term for term in case["expect_any"] if term.lower() in top_text]
-    if direct_matched:
+    required_top_id = case.get("require_top_id")
+    top_id_ok = not required_top_id or (results and results[0].get("id") == required_top_id)
+    if required_top_id and not top_id_ok:
+        score = 0
+    elif direct_matched:
         score = 2
     elif matched:
         score = 1
@@ -145,6 +172,8 @@ def score_live_case(case: dict, results: list) -> dict:
         "top_matched": top_matched,
         "top_ids": [item.get("id") for item in results[:3]],
         "top_scores": [item.get("score") for item in results[:3]],
+        "required_top_id": required_top_id,
+        "top_id_ok": top_id_ok,
     }
 
 
@@ -221,11 +250,16 @@ def main() -> int:
 
     total = sum(item.get("score", 0) for item in reports)
     max_total = sum(item.get("max_score", 2) for item in reports)
+    guardrail_failures = [
+        item for item in reports
+        if item.get("required_top_id") and not item.get("top_id_ok")
+    ]
     summary = {
         "total": total,
         "max_total": max_total,
         "pct": round(total / max_total * 100, 1) if max_total else 0,
-        "pass": total >= int(max_total * 0.75),
+        "pass": total >= int(max_total * 0.75) and not guardrail_failures,
+        "guardrail_failures": guardrail_failures,
         "cases": reports,
     }
 

@@ -1,0 +1,120 @@
+{
+  "timestamp": "2026-06-09T17:58:20.505181",
+  "api_base": "http://127.0.0.1:8904",
+  "total": 14,
+  "passed": 12,
+  "failed": 2,
+  "pct": 85.7,
+  "dimensions": {
+    "Reranker": {
+      "pass": 2,
+      "fail": 1
+    },
+    "MinHash Dedup": {
+      "pass": 1,
+      "fail": 1
+    },
+    "Bridge Entity": {
+      "pass": 2,
+      "fail": 0
+    },
+    "Token Budget": {
+      "pass": 3,
+      "fail": 0
+    },
+    "Backtrack": {
+      "pass": 2,
+      "fail": 0
+    },
+    "Verify": {
+      "pass": 2,
+      "fail": 0
+    }
+  },
+  "tests": [
+    {
+      "dimension": "Reranker",
+      "test": "reranker disabled (flag=0) - system stable",
+      "passed": true,
+      "detail": "MAGMA_FEATURE_LOCAL_RERANKER=0, system runs without crash"
+    },
+    {
+      "dimension": "Reranker",
+      "test": "reranker_score absent when disabled",
+      "passed": false,
+      "detail": "score present despite flag=0 (unexpected)"
+    },
+    {
+      "dimension": "Reranker",
+      "test": "fused_score not applied when disabled",
+      "passed": true,
+      "detail": "correctly skipped"
+    },
+    {
+      "dimension": "MinHash Dedup",
+      "test": "similar content triggers dedup",
+      "passed": false,
+      "detail": "resp2: status=ok, dedup=None, written=1"
+    },
+    {
+      "dimension": "MinHash Dedup",
+      "test": "different content passes dedup",
+      "passed": true,
+      "detail": "resp4: status=ok, dedup=None"
+    },
+    {
+      "dimension": "Bridge Entity",
+      "test": "bridge_entity_count >= 1",
+      "passed": true,
+      "detail": "bridge_entity_count=2, bridge_entities_list=2"
+    },
+    {
+      "dimension": "Bridge Entity",
+      "test": "bridge_quality_boost > 0",
+      "passed": true,
+      "detail": "bridge_quality_boost=0.1"
+    },
+    {
+      "dimension": "Token Budget",
+      "test": "critical: no token_usage_ratio",
+      "passed": true,
+      "detail": "correctly omitted"
+    },
+    {
+      "dimension": "Token Budget",
+      "test": "normal: has token_usage_ratio",
+      "passed": true,
+      "detail": "token_usage_ratio=0.362"
+    },
+    {
+      "dimension": "Token Budget",
+      "test": "low: budget_warning when ratio>0.6",
+      "passed": true,
+      "detail": "ratio=0.362 <= 0.6, no warning expected (pass by design)"
+    },
+    {
+      "dimension": "Backtrack",
+      "test": "3rd repeat triggers backtrack_warning",
+      "passed": true,
+      "detail": "backtrack_warning=True, narrative=⚠️ 检测到搜索结果重复率较高（100%），建议：\n1. 调整查询角度，使用不同的关键词\n2. 检查是否有被忽略的记忆（magma_feedback 标注 mi"
+    },
+    {
+      "dimension": "Backtrack",
+      "test": "different query: no backtrack_warning",
+      "passed": true,
+      "detail": "backtrack_warning=None"
+    },
+    {
+      "dimension": "Verify",
+      "test": "verify returns verdict/evidence/confidence",
+      "passed": true,
+      "detail": "verdict=unsupported, confidence=0.0, evidence_len=39"
+    },
+    {
+      "dimension": "Verify",
+      "test": "verdict is supported/unsupported/partial",
+      "passed": true,
+      "detail": "verdict='unsupported'"
+    }
+  ]
+}

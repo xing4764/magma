@@ -1,14 +1,56 @@
-﻿"""Shared retrieval logic for MAGMA API and MCP entrypoints."""
+"""Shared retrieval logic for MAGMA API and MCP entrypoints."""
 
 import json
 import logging
 import math
+import os
 import re
 import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import numpy as np
+
+# --- P0-1: Feature Flags (Harness-1 style, default ON for existing MAGMA features) ---
+MAGMA_FEATURE_BEAM_SEARCH = os.environ.get("MAGMA_FEATURE_BEAM_SEARCH", "1") == "1"
+MAGMA_FEATURE_RECENCY_BOOST = os.environ.get("MAGMA_FEATURE_RECENCY_BOOST", "1") == "1"
+MAGMA_FEATURE_RRF_FUSION = os.environ.get("MAGMA_FEATURE_RRF_FUSION", "1") == "1"
+MAGMA_FEATURE_GRAPH_WALK = os.environ.get("MAGMA_FEATURE_GRAPH_WALK", "1") == "1"
+MAGMA_FEATURE_INTENT_ROUTING = os.environ.get("MAGMA_FEATURE_INTENT_ROUTING", "1") == "1"
+
+# --- P0-2: Importance Label Semantics ---
+IMPORTANCE_LABEL_THRESHOLDS = {
+    "critical": 0.9,   # force-retain, never evict
+    "useful": 0.6,     # direct use
+    "reference": 0.3,  # backup / consult
+    "noise": 0.0,      # prefer eviction
+}
+
+IMPORTANCE_LABEL_FROM_VALUE = [
+    (0.9, "critical"),
+    (0.6, "useful"),
+    (0.3, "reference"),
+    (0.0, "noise"),
+]
+
+
+def importance_label_from_value(importance: float) -> str:
+    """Map importance value (0-1) to semantic label."""
+    for threshold, label in IMPORTANCE_LABEL_FROM_VALUE:
+        if importance >= threshold:
+            return label
+    return "noise"
+
+
+def importance_value_from_label(label: str) -> Optional[float]:
+    """Map semantic label to an importance value (returns midpoint of range)."""
+    mapping = {
+        "critical": 0.95,
+        "useful": 0.75,
+        "reference": 0.45,
+        "noise": 0.15,
+    }
+    return mapping.get(label)
 
 from magma.entities import classify_memory_scope, extract_entities
 from magma.short_command import (
@@ -41,6 +83,10 @@ INTENT_KEYWORDS = {
     ),
 }
 
+# --- P1-4: Subtractive Curation Feature Flag ---
+MAGMA_FEATURE_SUBTRACTIVE_CURATION = os.environ.get("MAGMA_FEATURE_SUBTRACTIVE_CURATION", "1") == "1"
+MAGMA_CURATED_SET_SIZE = int(os.environ.get("MAGMA_CURATED_SET_SIZE", "8"))
+
 # --- P1: Intent-aware routing (arxiv:2601.03236) ---
 _INTENT_PATTERNS = {
     "why": [
@@ -72,14 +118,25 @@ RRF_K = 60  # Reciprocal Rank Fusion constant (论文默认值)
 # --- P1: Recency Boost ---
 RECENCY_KEYWORDS = (
     "最近", "最新", "当前", "现在", "今晚", "刚才", "今天",
+    "昨晚", "今早", "今晨", "下午", "上午", "傍晚",
     "升级后", "回退后", "稳定基准", "当前版本",
     "latest", "recent", "current", "目前",
+    "this evening", "tonight", "just now", "earlier today",
 )
 
 # Layers that receive strong recency boost
 RECENCY_BOOSTED_LAYERS = {"L1", "fact", "current_state", "summary", "decision", "ops_anchor"}
 # Layers that never receive recency boost
 RECENCY_EXCLUDED_LAYERS = {"debug", "temporary"}
+# L0 recency boost tiers (age_hours -> multiplier) for recency-intent queries
+_L0_RECENCY_TIERS = [
+    (1,   1.50),   # < 1 hour: very fresh conversation, strong boost
+    (3,   1.40),   # < 3 hours
+    (6,   1.30),   # < 6 hours
+    (12,  1.20),   # < 12 hours (covers "tonight" / "today")
+    (24,  1.10),   # < 24 hours
+    (72,  1.05),   # < 3 days
+]
 
 
 
@@ -117,12 +174,19 @@ def _compute_recency_boost(
     # Excluded layers never get boosted
     if layer in RECENCY_EXCLUDED_LAYERS:
         return 1.0
-    # Non-boosted layers only get light boost when recency_query
-    if layer not in RECENCY_BOOSTED_LAYERS:
-        # L0: no strong boost unless query explicitly asks "刚才我说了什么"
-        if layer == "L0":
+    # L0 nodes: strong recency boost when query has recency intent
+    # This is the key fix: L0 records are raw conversation captures, and when
+    # the user asks "今晚做了什么" / "最近聊了什么", recent L0 records should
+    # outrank older high-importance L1 summaries.
+    if layer == "L0":
+        if not recency_query:
             return 1.0
-        # Other unlisted layers: no boost
+        for tier_hours, tier_mult in _L0_RECENCY_TIERS:
+            if age_hours < tier_hours:
+                return tier_mult
+        return 1.0
+    # Other unlisted layers: no boost
+    if layer not in RECENCY_BOOSTED_LAYERS:
         return 1.0
     if recency_query:
         if age_hours < 24:
@@ -156,6 +220,21 @@ OPERATIONAL_KEYWORDS = (
     "2026.5.20",
     "5.20",
     "5.22",
+    "5.27",
+    "5.28",
+    "6.0",
+    "6.1",
+    "version",
+    "version pin",
+    "latest",
+    "npm",
+    "upgrade",
+    "update",
+    "\u7248\u672c",
+    "\u6700\u65b0",
+    "\u6d4b\u8bd5\u7248",
+    "\u5347\u7ea7",
+    "\u66f4\u65b0",
     "magma_doctor.py",
     "magma_ops.py",
     "magma-recall",
@@ -183,11 +262,36 @@ OPERATIONAL_TRIGGER_KEYWORDS = OPERATIONAL_KEYWORDS + (
 )
 
 HIGH_DENSITY_LAYERS = {"ops_anchor", "L1", "summary", "decision", "fact", "current_state", "core_memory"}
+OPENCLAW_VERSION_ANCHOR_ID = "ops:openclaw:version-pin-2026-5-20"
+OPENCLAW_VERSION_TERMS = (
+    "openclaw",
+    "5.20",
+    "5.22",
+    "5.27",
+    "5.28",
+    "6.0",
+    "6.1",
+    "gateway",
+    "npm",
+    "codex",
+    "feishu",
+    "\u7248\u672c",
+    "\u6700\u65b0",
+    "\u6d4b\u8bd5\u7248",
+    "\u5347\u7ea7",
+)
 
 
 def _is_operational_query(query: str) -> bool:
     query_lower = (query or "").lower()
     return any(keyword.lower() in query_lower for keyword in OPERATIONAL_TRIGGER_KEYWORDS)
+
+
+def _is_openclaw_version_query(query: str) -> bool:
+    q = (query or "").lower()
+    if "openclaw" in q:
+        return any(term.lower() in q for term in OPENCLAW_VERSION_TERMS)
+    return any(term.lower() in q for term in ("5.20", "5.22", "5.27", "5.28", "6.0", "6.1"))
 
 
 def _parse_time(value: Optional[str]) -> Optional[datetime]:
@@ -375,7 +479,7 @@ def _entity_overlap_multiplier(query_entities: List[Dict[str, str]], node: Dict[
     return min(base, 1.65)
 
 
-def _memory_quality_multiplier(node: Dict[str, Any]) -> float:
+def _memory_quality_multiplier(node: Dict[str, Any], recency_query: bool = False) -> float:
     props = node.get("properties", {}) or {}
     layer = props.get("layer")
     kind = props.get("kind")
@@ -401,6 +505,14 @@ def _memory_quality_multiplier(node: Dict[str, Any]) -> float:
         return 1.03 if label == "topic" else 1.0
     role = props.get("role")
     content = str(props.get("content") or "")
+    # For recency queries, L0 raw conversation is the primary target —
+    # boost quality instead of penalizing it.
+    if recency_query:
+        if role == "assistant":
+            return 1.02
+        if role == "user":
+            return 1.05
+        return 1.0
     if role == "assistant":
         multiplier = 0.98
         lower = content.lower()
@@ -423,7 +535,7 @@ def _memory_quality_multiplier(node: Dict[str, Any]) -> float:
     return 0.86
 
 
-def _operational_authority_multiplier(query: str, node: Dict[str, Any], keyword_score: float) -> float:
+def _operational_authority_multiplier(query: str, node: Dict[str, Any], keyword_score: float, recency_query: bool = False) -> float:
     if not _is_operational_query(query):
         return 1.0
     props = node.get("properties", {}) or {}
@@ -440,11 +552,15 @@ def _operational_authority_multiplier(query: str, node: Dict[str, Any], keyword_
     if label == "topic" and memory_scope == "system":
         return 1.1 if keyword_score >= 0.2 else 1.0
     if layer == "L0":
+        # Don't penalize L0 when query has recency intent —
+        # user is asking "what happened recently" and L0 is the raw record
+        if recency_query:
+            return 1.0
         return 0.92 if keyword_score < 0.15 else 0.98
     return 1.0
 
 
-def _lifecycle_multiplier(node: Dict[str, Any]) -> float:
+def _lifecycle_multiplier(node: Dict[str, Any], recency_query: bool = False) -> float:
     now = datetime.utcnow()
     status = node.get("status") or "active"
     if status == "deleted":
@@ -469,7 +585,14 @@ def _lifecycle_multiplier(node: Dict[str, Any]) -> float:
 
     access_count = int(node.get("access_count") or 0)
     importance = float(node.get("importance") or 0.5)
-    multiplier *= 0.75 + min(max(importance, 0.0), 1.0) * 0.35
+    # P0-2: noise-labeled nodes decay 2x faster
+    importance_label = node.get("importance_label") or (node.get("properties") or {}).get("importance_label")
+    if importance_label == "noise":
+        multiplier *= 0.5
+    # For recency queries, dampen the importance bonus so old high-importance
+    # nodes don't dominate over fresh low-importance L0 conversation records.
+    importance_weight = 0.10 if recency_query else 0.35
+    multiplier *= 0.75 + min(max(importance, 0.0), 1.0) * importance_weight
     multiplier += min(math.log1p(access_count) * 0.03, 0.12)
     return max(multiplier, 0.0)
 
@@ -593,14 +716,111 @@ def _promote_operational_anchor(results: List[Dict[str, Any]], top_k: int, query
     return selected[:top_k]
 
 
+def _inject_openclaw_version_anchor(store: Any, results: List[Dict[str, Any]], query: str) -> List[Dict[str, Any]]:
+    if not _is_openclaw_version_query(query):
+        return results
+    if any(item.get("id") == OPENCLAW_VERSION_ANCHOR_ID for item in results):
+        return results
+    anchor = store.get_node(OPENCLAW_VERSION_ANCHOR_ID)
+    if not anchor or anchor.get("status") == "deleted":
+        return results
+
+    max_score = max((float(item.get("score", 0.0) or 0.0) for item in results), default=1.0)
+    keyword_score = _keyword_score(query, anchor)
+    provenance = _provenance(anchor)
+    anchor["score"] = round(max_score + 0.5, 6)
+    anchor["semantic_score"] = 0.0
+    anchor["keyword_score"] = round(float(keyword_score), 6)
+    anchor["score_breakdown"] = {
+        "forced_operational_anchor": True,
+        "reason": "openclaw_version_query",
+        "keyword_score": round(float(keyword_score), 4),
+    }
+    anchor["query_scope"] = "system"
+    anchor["memory_scope"] = _memory_scope(anchor)
+    anchor["retrieval_source"] = "forced_operational_anchor"
+    anchor["provenance"] = provenance
+    anchor["source_agent_id"] = provenance.get("agent_id")
+    anchor["memory_source"] = provenance.get("source")
+    anchor["source_session_key"] = provenance.get("session_key")
+    return [anchor] + results
+
+
+# --- P2-5: Backtrack Detection (session query history) ---
+_session_query_history: Dict[str, List[Tuple[float, List[str]]]] = {}  # session_key -> [(timestamp, [node_ids])]
+_BACKTRACK_WINDOW = 3   # Number of recent queries to compare
+_BACKTRACK_THRESHOLD = 0.6  # 60% overlap triggers warning
+_BACKTRACK_HISTORY_TTL = 300  # 5 minutes
+_BACKTRACK_MAX_SESSIONS = 256
+
+
+def _check_backtrack(session_key: str, result_ids: List[str]) -> Optional[Dict[str, Any]]:
+    """P2-5: Detect if agent is stuck in an ineffective search loop.
+
+    Returns warning dict if backtrack detected, None otherwise.
+    """
+    if not session_key or not result_ids:
+        return None
+
+    now = time.time()
+
+    # Initialize or get history
+    if session_key not in _session_query_history:
+        # Evict old sessions if too many
+        if len(_session_query_history) >= _BACKTRACK_MAX_SESSIONS:
+            cutoff = now - _BACKTRACK_HISTORY_TTL
+            stale = [k for k, v in _session_query_history.items()
+                     if not v or v[-1][0] < cutoff]
+            for k in stale[:64]:
+                _session_query_history.pop(k, None)
+        _session_query_history[session_key] = []
+
+    history = _session_query_history[session_key]
+
+    # Clean old entries
+    history[:] = [(ts, ids) for ts, ids in history if now - ts < _BACKTRACK_HISTORY_TTL]
+
+    # Check overlap with recent queries
+    current_set = set(result_ids)
+    warnings = []
+
+    for ts, prev_ids in history[-_BACKTRACK_WINDOW:]:
+        prev_set = set(prev_ids)
+        if not prev_set:
+            continue
+        overlap = len(current_set & prev_set)
+        overlap_ratio = overlap / max(len(current_set), 1)
+        if overlap_ratio > _BACKTRACK_THRESHOLD:
+            warnings.append(overlap_ratio)
+
+    # Record this query
+    history.append((now, result_ids))
+    # Keep history bounded
+    if len(history) > _BACKTRACK_WINDOW * 2:
+        history[:] = history[-_BACKTRACK_WINDOW * 2:]
+
+    if warnings:
+        avg_overlap = sum(warnings) / len(warnings)
+        return {
+            "backtrack_detected": True,
+            "overlap_ratio": round(avg_overlap, 2),
+            "queries_compared": len(warnings),
+        }
+    return None
+
+
 # --- Graph Walk Cache (module-level, 5-min TTL) ---
 _graph_walk_cache: Dict[str, Tuple[float, Dict[str, float]]] = {}
 _GRAPH_WALK_TTL = 300  # 5 minutes
 _GRAPH_WALK_MAX_CACHE = 512
 
 
-def _cache_key(node_ids: List[str], hops: int) -> str:
-    return "|".join(sorted(node_ids)) + f":h{hops}"
+def _cache_key(node_ids: List[str], hops: int, intent: str = None) -> str:
+    """P2-2: Intent-aware cache key. Different intents don't share cache."""
+    base = "|".join(sorted(node_ids)) + f":h{hops}"
+    if intent:
+        base += f":i={intent}"
+    return base
 
 
 def _cache_get(key: str) -> Optional[Dict[str, float]]:
@@ -635,13 +855,18 @@ def graph_walk(store, source_node_ids: List[str], hops: int = 2, max_neighbors_p
     if not source_node_ids:
         return {}
 
-    # For causal intent, skip cache (different weights needed)
+    # P2-2: Intent-aware caching — causal intent never cached
     primary_intent = (intent or {}).get("primary", "semantic")
     if primary_intent != "causal":
-        cache_key = _cache_key(source_node_ids, hops)
+        cache_key = _cache_key(source_node_ids, hops, intent=primary_intent)
         cached = _cache_get(cache_key)
         if cached is not None:
+            # P2-2: Mark cache hit in returned data for score_breakdown exposure
+            for nid in cached:
+                pass  # data already scored
             return cached
+    else:
+        cache_key = None  # causal never cached
 
     # BFS-style traversal
     visited: Set[str] = set(source_node_ids)
@@ -688,7 +913,7 @@ def graph_walk(store, source_node_ids: List[str], hops: int = 2, max_neighbors_p
             break
         current_frontier = next_frontier
 
-    # Only cache non-empty results (skip for causal intent since weights differ)
+    # Only cache non-empty results (never cache causal intent)
     if result and primary_intent != "causal":
         _cache_put(cache_key, result)
     return result
@@ -924,14 +1149,18 @@ class MemorySearcher:
         label = filters.get("label")
         pool_size = int(filters.get("pool_size", 99999))
         property_filters = _property_filters(filters)
-        intent = filters.get("intent") or classify_intent(query)
+        # --- P0-1: Feature Flag guards ---
+        if MAGMA_FEATURE_INTENT_ROUTING:
+            intent = filters.get("intent") or classify_intent(query)
+        else:
+            intent = {"primary": "general", "scores": {}, "weights": INTENT_WEIGHTS["general"]}
         include_related = bool(filters.get("include_related", False))
         related_limit = int(filters.get("related_limit", 3))
         include_versions = bool(filters.get("include_versions", False))
         version_limit = int(filters.get("version_limit", 2))
         query_entities = extract_entities(query)
         query_scope = classify_memory_scope(query_entities)
-        recency_query = _detect_recency_intent(query)
+        recency_query = _detect_recency_intent(query) if MAGMA_FEATURE_RECENCY_BOOST else False
 
         # --- Pre-compute shared query data once ---
         query_lower = query.lower()
@@ -1023,12 +1252,12 @@ class MemorySearcher:
             if semantic_score <= 0 and keyword_score <= 0:
                 continue
 
-            lifecycle = _lifecycle_multiplier(node)
+            lifecycle = _lifecycle_multiplier(node, recency_query)
             agent_scope = _agent_scope_multiplier(node, filters)
             intent_scope = _intent_multiplier(node, intent)
             entity_scope = _entity_overlap_multiplier(query_entities, node)
-            quality_scope = _memory_quality_multiplier(node)
-            authority_scope = _operational_authority_multiplier(query, node, keyword_score)
+            quality_scope = _memory_quality_multiplier(node, recency_query)
+            authority_scope = _operational_authority_multiplier(query, node, keyword_score, recency_query)
             props_for_recency = node.get("properties") or {}
             layer_for_recency = props_for_recency.get("layer")
             age_hours = _node_age_hours(node)
@@ -1084,6 +1313,7 @@ class MemorySearcher:
             node["query_scope"] = query_scope
             node["query_intent"] = intent
             node["memory_scope"] = memory_scope
+            node["importance_label"] = importance_label_from_value(float(node.get("importance") or 0.5))
             node["retrieval_source"] = "memory"
             node["provenance"] = provenance
             node["source_agent_id"] = provenance.get("agent_id")
@@ -1121,11 +1351,15 @@ class MemorySearcher:
                 )
 
         # --- P0: Graph Walk Engine (HippoRAG-style) ---
-        # Take top-K candidates from FAISS+keyword scoring, walk 2 hops on graph
-        if len(results) > 0:
+        if MAGMA_FEATURE_GRAPH_WALK and len(results) > 0:
             graph_seed_size = min(max(top_k * 2, 10), len(results))
             seed_ids = [item["id"] for item in results[:graph_seed_size]]
             graph_scores = graph_walk(self.store, seed_ids, hops=2, intent=intent)
+
+            # P2-2: Detect cache hit for score_breakdown exposure
+            _gw_primary = (intent or {}).get("primary", "semantic")
+            _gw_cache_key = _cache_key(seed_ids, 2, intent=_gw_primary) if _gw_primary != "causal" else None
+            _gw_cache_hit = _gw_cache_key is not None and _cache_get(_gw_cache_key) is not None
 
             if graph_scores:
                 existing_ids = {item["id"] for item in results}
@@ -1141,6 +1375,7 @@ class MemorySearcher:
                         item["graph_score"] = graph_score
                         item["score_breakdown"]["graph_score"] = round(graph_score, 4)
                         item["score_breakdown"]["fused_score"] = round(fused, 4)
+                        item["score_breakdown"]["cache_hit"] = _gw_cache_hit
 
                 # Fetch graph-discovered nodes not in original results
                 new_node_ids = [nid for nid in graph_scores if nid not in existing_ids]
@@ -1157,12 +1392,12 @@ class MemorySearcher:
                         keyword_score = _keyword_score(query, node, searchable, query_terms)
                         semantic_score = faiss_semantic.get(nid, 0.0)
                         base_score = semantic_score * 0.75 + keyword_score * 0.25
-                        lifecycle = _lifecycle_multiplier(node)
+                        lifecycle = _lifecycle_multiplier(node, recency_query)
                         agent_scope = _agent_scope_multiplier(node, filters)
                         intent_scope = _intent_multiplier(node, intent)
                         entity_scope = _entity_overlap_multiplier(query_entities, node)
-                        quality_scope = _memory_quality_multiplier(node)
-                        authority_scope = _operational_authority_multiplier(query, node, keyword_score)
+                        quality_scope = _memory_quality_multiplier(node, recency_query)
+                        authority_scope = _operational_authority_multiplier(query, node, keyword_score, recency_query)
                         props_for_recency = node.get("properties") or {}
                         layer_for_recency = props_for_recency.get("layer")
                         age_hours = _node_age_hours(node)
@@ -1209,6 +1444,7 @@ class MemorySearcher:
                         node["query_scope"] = query_scope
                         node["query_intent"] = intent
                         node["memory_scope"] = memory_scope
+                        node["importance_label"] = importance_label_from_value(float(node.get("importance") or 0.5))
                         node["retrieval_source"] = "graph_walk"
                         node["graph_boost"] = True
                         node["graph_score"] = graph_score
@@ -1221,12 +1457,11 @@ class MemorySearcher:
                 # Re-sort with graph-boosted scores
                 results.sort(key=lambda item: item["score"], reverse=True)
 
-        # --- P1: RRF Fusion (Reciprocal Rank Fusion) ---
-        # Build 3 ranked lists: semantic, keyword, temporal
+        # --- P1-7: Intent-driven RRF Fusion (Reciprocal Rank Fusion) ---
         p1_intent = intent.get("p1_intent") or intent.get("primary", "general")
         intent_weights = intent.get("p1_weights") or INTENT_WEIGHTS.get(p1_intent, INTENT_WEIGHTS["general"])
 
-        if results:
+        if MAGMA_FEATURE_RRF_FUSION and results:
             # Semantic ranked list (by semantic_score desc)
             semantic_ranked = sorted(results, key=lambda x: x.get("semantic_score", 0), reverse=True)
             semantic_ids = [r["id"] for r in semantic_ranked]
@@ -1242,17 +1477,47 @@ class MemorySearcher:
             temporal_ranked = sorted(results, key=_temporal_sort_key, reverse=True)
             temporal_ids = [r["id"] for r in temporal_ranked]
 
-            # RRF fusion with intent-driven weights
+            # Intent-driven RRF weight map
+            # P1-7: Dynamic weights based on query intent
             rrf_weight_map = {
                 "semantic": intent_weights.get("w_semantic", 1.0),
                 "keyword": 1.0,
                 "temporal": intent_weights.get("w_temporal", 1.0),
             }
-            rrf_result = rrf_fusion(
-                [semantic_ids, keyword_ids, temporal_ids],
-                k=RRF_K,
-                weights=[rrf_weight_map["semantic"], rrf_weight_map["keyword"], rrf_weight_map["temporal"]],
-            )
+
+            # Add causal-ranked list for 'why' intent (boost causal edges ×5.0)
+            ranked_lists = [semantic_ids, keyword_ids, temporal_ids]
+            rrf_list_names = ["semantic", "keyword", "temporal"]
+
+            if p1_intent in ("why", "causal"):
+                # Rank by graph causal connectivity (nodes with caused_by edges rank higher)
+                causal_ranked = sorted(
+                    results,
+                    key=lambda x: 1.0 if (x.get("properties") or {}).get("role") in ("cause", "effect") or
+                                      (x.get("label") or "") in ("cause", "effect") else 0.0,
+                    reverse=True
+                )
+                causal_ids = [r["id"] for r in causal_ranked]
+                causal_weight = intent_weights.get("w_causal", 5.0)
+                ranked_lists.append(causal_ids)
+                rrf_list_names.append("causal")
+                rrf_weight_map["causal"] = causal_weight
+
+            if p1_intent == "entity":
+                # Rank by entity overlap score
+                entity_ranked = sorted(
+                    results,
+                    key=lambda x: x.get("entity_overlap_multiplier", 1.0),
+                    reverse=True
+                )
+                entity_ids = [r["id"] for r in entity_ranked]
+                entity_weight = intent_weights.get("w_entity", 3.0)
+                ranked_lists.append(entity_ids)
+                rrf_list_names.append("entity")
+                rrf_weight_map["entity"] = entity_weight
+
+            rrf_weights = [rrf_weight_map[name] for name in rrf_list_names]
+            rrf_result = rrf_fusion(ranked_lists, k=RRF_K, weights=rrf_weights)
             rrf_scores = {nid: score for nid, score in rrf_result}
 
             # Apply RRF as a blended signal (keep original scoring structure, add RRF as boost)
@@ -1267,12 +1532,13 @@ class MemorySearcher:
                     item["score"] = round(blended, 6)
                     item["score_breakdown"]["rrf_score"] = round(rrf_s, 6)
                     item["score_breakdown"]["rrf_normalized"] = round(rrf_normalized, 4)
+                    item["score_breakdown"]["rrf_intent_weights"] = rrf_weight_map
 
             results.sort(key=lambda x: x["score"], reverse=True)
 
         # --- P1: Beam Search (strategy-guided graph traversal) ---
         # Only run beam search for structured intents (why/when/entity), skip for general
-        if p1_intent in ("why", "when", "entity") and results:
+        if MAGMA_FEATURE_BEAM_SEARCH and p1_intent in ("why", "when", "entity") and results:
             beam_anchor_count = min(max(top_k, 5), len(results))
             anchor_ids = [r["id"] for r in results[:beam_anchor_count]]
             semantic_score_map = {r["id"]: r.get("semantic_score", 0.0) for r in results}
@@ -1310,9 +1576,9 @@ class MemorySearcher:
                             keyword_score = _keyword_score(query, node, searchable, query_terms)
                             semantic_score = semantic_score_map.get(nid, 0.0)
                             base_score = semantic_score * 0.75 + keyword_score * 0.25
-                            lifecycle = _lifecycle_multiplier(node)
+                            lifecycle = _lifecycle_multiplier(node, recency_query)
                             intent_scope = _intent_multiplier(node, intent)
-                            quality_scope = _memory_quality_multiplier(node)
+                            quality_scope = _memory_quality_multiplier(node, recency_query)
                             beam_score = br["score"] * 0.15
                             props_for_recency = node.get("properties") or {}
                             layer_for_recency = props_for_recency.get("layer")
@@ -1340,6 +1606,7 @@ class MemorySearcher:
                             node["query_scope"] = query_scope
                             node["query_intent"] = intent
                             node["memory_scope"] = memory_scope
+                            node["importance_label"] = importance_label_from_value(float(node.get("importance") or 0.5))
                             node["retrieval_source"] = "beam_search"
                             node["beam_path"] = br["path"]
                             node["beam_hop"] = br["hop"]
@@ -1353,6 +1620,12 @@ class MemorySearcher:
 
                 results.sort(key=lambda x: x["score"], reverse=True)
 
+        # --- P2-1: Local Reranker (optional cross-encoder reranking) ---
+        from magma.reranker import rerank_results, MAGMA_FEATURE_LOCAL_RERANKER as _RERANKER_ENABLED
+        if _RERANKER_ENABLED and results:
+            results = rerank_results(query, results, top_k=top_k * 2)
+
+        results = _inject_openclaw_version_anchor(self.store, results, query)
         results = _promote_operational_anchor(results, top_k, query)
         results = _diversify_by_scope(results, top_k, query_scope)
         if include_related:
@@ -1405,11 +1678,11 @@ class MemorySearcher:
                     provenance = _provenance(item)
                     item["semantic_score"] = 0.0
                     item["keyword_score"] = 0.0
-                    item["lifecycle_multiplier"] = round(float(_lifecycle_multiplier(item)), 6)
+                    item["lifecycle_multiplier"] = round(float(_lifecycle_multiplier(item, recency_query)), 6)
                     item["agent_scope_multiplier"] = round(float(_agent_scope_multiplier(item, filters)), 6)
                     item["intent_multiplier"] = round(float(_intent_multiplier(item, intent)), 6)
                     item["entity_overlap_multiplier"] = 1.0
-                    item["memory_quality_multiplier"] = round(float(_memory_quality_multiplier(item)), 6)
+                    item["memory_quality_multiplier"] = round(float(_memory_quality_multiplier(item, recency_query)), 6)
                     item["operational_authority_multiplier"] = 1.0
                     item["recency_boost"] = 1.0
                     item["age_hours"] = round(float(_node_age_hours(item)), 2) if _node_age_hours(item) is not None else None
@@ -1440,5 +1713,125 @@ class MemorySearcher:
                     short_cmd_resolution
                 )
 
+        # --- P1-6: Two-Tier Result Marking ---
+        # Assign tier: "full" or "summary" to each result
+        tier_override = filters.get("tier_override")
+        for item in results:
+            props = item.get("properties", {}) or {}
+            layer = props.get("layer", "")
+            importance = float(item.get("importance", 0.5) or 0.5)
+            source_agent_id = item.get("source_agent_id") or props.get("source_agent_id") or ""
+
+            if tier_override:
+                item["tier"] = tier_override
+            elif importance >= 0.9 or source_agent_id:
+                # Core anchor nodes: always full
+                item["tier"] = "full"
+            elif layer == "L0":
+                item["tier"] = "full"
+            else:
+                item["tier"] = "summary"
+
+        # --- P1-5: Bridge Entity Detection ---
+        # Find entities that appear in >= 2 different nodes
+        entity_node_map: Dict[str, set] = {}  # entity_name -> set of node_ids
+        for item in results:
+            props = item.get("properties", {}) or {}
+            # Check entities from query_entities field or properties
+            entities = props.get("entities", [])
+            if isinstance(entities, list):
+                for ent in entities:
+                    if isinstance(ent, dict) and ent.get("name"):
+                        ent_name = ent["name"].lower()
+                        if ent_name not in entity_node_map:
+                            entity_node_map[ent_name] = set()
+                        entity_node_map[ent_name].add(item["id"])
+            # Also check entity anchors from edges
+            node_entities = item.get("query_entities", [])
+            for ent in node_entities:
+                if isinstance(ent, dict) and ent.get("name"):
+                    ent_name = ent["name"].lower()
+                    if ent_name not in entity_node_map:
+                        entity_node_map[ent_name] = set()
+                    entity_node_map[ent_name].add(item["id"])
+
+        bridge_entities = [
+            {"entity": name, "node_count": len(nids)}
+            for name, nids in entity_node_map.items()
+            if len(nids) >= 2
+        ]
+        bridge_count = len(bridge_entities)
+
+        # Apply bridge entity quality multiplier
+        bridge_quality_boost = min(bridge_count * 0.05, 0.3)  # max 1.3x
+        for item in results:
+            item["score_breakdown"]["bridge_entity_count"] = bridge_count
+            if bridge_quality_boost > 0:
+                original_mqm = item.get("memory_quality_multiplier", 1.0)
+                boosted_mqm = min(original_mqm + bridge_quality_boost, 1.3)
+                item["memory_quality_multiplier"] = round(boosted_mqm, 6)
+                item["score_breakdown"]["bridge_quality_boost"] = round(bridge_quality_boost, 4)
+                # Re-compute final score with bridge boost
+                item["score"] = round(item["score"] * (boosted_mqm / max(original_mqm, 0.01)), 6)
+
+        # --- P1-4: Subtractive Curation (active_context) ---
+        curated_set = []
+        if MAGMA_FEATURE_SUBTRACTIVE_CURATION and results:
+            # Score: importance × recency × access_count
+            def _curate_score(node):
+                props = node.get("properties", {}) or {}
+                importance = float(node.get("importance", 0.5) or 0.5)
+                access_count = int(node.get("access_count", 0) or 0)
+                age_hours = node.get("age_hours")
+                if age_hours is None:
+                    age_hours = _node_age_hours(node) or 720  # default 30 days
+                recency = 1.0 / (1.0 + age_hours / 24.0)  # decay over days
+                return importance * recency * (1.0 + min(access_count, 50) * 0.02)
+
+            sorted_for_curate = sorted(results, key=_curate_score, reverse=True)
+            curated_ids = set()
+            for node in sorted_for_curate:
+                if len(curated_set) >= MAGMA_CURATED_SET_SIZE:
+                    break
+                nid = node["id"]
+                if nid not in curated_ids:
+                    curated_set.append(nid)
+                    curated_ids.add(nid)
+
+            # Add full_content to curated nodes, summary to others
+            for item in results:
+                props = item.get("properties", {}) or {}
+                if item["id"] in curated_ids:
+                    item["curated"] = True
+                    item["full_content"] = props.get("content", "") or props.get("summary", "") or ""
+                else:
+                    item["curated"] = False
+                    # Non-curated: only summary (already present in properties)
+
         self.store.touch_nodes([item["id"] for item in results])
+
+        # --- P2-5: Backtrack Detection ---
+        session_key = filters.get("session_key") or filters.get("session_id") or ""
+        if session_key and results:
+            result_ids = [r["id"] for r in results[:top_k]]
+            backtrack = _check_backtrack(session_key, result_ids)
+            if backtrack and results:
+                # Inject warning into first result for API response
+                results[0]["backtrack_warning"] = True
+                overlap_pct = int(backtrack["overlap_ratio"] * 100)
+                warning_msg = (
+                    f"⚠️ 检测到搜索结果重复率较高（{overlap_pct}%），建议：\n"
+                    f"1. 调整查询角度，使用不同的关键词\n"
+                    f"2. 检查是否有被忽略的记忆（magma_feedback 标注 miss）\n"
+                    f"3. 使用 explain_recall 分析召回逻辑"
+                )
+                results[0]["backtrack_narrative"] = warning_msg
+                logger.info(
+                    f"Backtrack detected for session {session_key}: "
+                    f"overlap={backtrack['overlap_ratio']:.0%}, "
+                    f"queries={backtrack['queries_compared']}"
+                )
+            elif results:
+                results[0]["backtrack_warning"] = False
+
         return results

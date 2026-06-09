@@ -289,6 +289,7 @@ def synthesize_narrative(
     query: str,
     intent: Dict[str, Any],
     store=None,
+    priority: str = "normal",
 ) -> Dict[str, Any]:
     """Synthesize ordered linear narrative from search results.
 
@@ -299,6 +300,7 @@ def synthesize_narrative(
         query: original query string
         intent: intent dict from classify_intent()
         store: optional graph store for edge queries
+        priority: P2-6 priority level ("critical", "normal", "low")
 
     Returns:
         dict with:
@@ -346,9 +348,34 @@ def synthesize_narrative(
     narrative_lines.append(header)
 
     # Body: ordered narrative
+    # P1-4/P1-6: Curated/full nodes get full content, summary nodes get truncated
+    curated_ids = {r["id"] for r in ordered_results if r.get("curated")}
+    has_tiers = any(r.get("tier") for r in ordered_results)
+
+    # P2-4: Sentence compression for summary-tier nodes
+    _compress_enabled = False
+    try:
+        from magma.sentence_compress import is_compress_enabled, apply_compression_to_node
+        _compress_enabled = is_compress_enabled()
+    except ImportError:
+        pass
+
     for i, (result, ref) in enumerate(zip(ordered_results, references)):
         ref_id = ref["ref_id"]
-        node_text = _format_node_narrative(result, ref_id, per_node_budget)
+        tier = result.get("tier", "full")
+        is_curated = result.get("id") in curated_ids
+
+        # P2-4: Apply sentence compression to summary-tier nodes
+        if _compress_enabled and has_tiers and tier == "summary" and not is_curated:
+            result = apply_compression_to_node(result, query=query, top_k=4)
+
+        # For summary-tier or non-curated nodes, use smaller budget
+        if has_tiers and tier == "summary" and not is_curated:
+            node_budget = per_node_budget // 2
+        else:
+            node_budget = per_node_budget
+
+        node_text = _format_node_narrative(result, ref_id, node_budget)
         estimated_tokens = len(node_text) // 2  # rough estimate
 
         if tokens_used + estimated_tokens > token_budget:
@@ -362,7 +389,13 @@ def synthesize_narrative(
             narrative_lines.append(f"\n... (共 {len(ordered_results)} 条结果，已展示 {i + 1} 条)")
             break
 
-        narrative_lines.append(node_text)
+        # P1-4/P1-6: Add tier/curated marker
+        marker = ""
+        if is_curated:
+            marker = " ★"
+        elif has_tiers and tier == "summary":
+            marker = " ◇"
+        narrative_lines.append(node_text + marker)
         tokens_used += estimated_tokens
 
     # Footer with reference count
@@ -370,7 +403,10 @@ def synthesize_narrative(
 
     narrative = "\n".join(narrative_lines)
 
-    return {
+    # P2-6: Token budget priority control
+    usage_ratio = round(min(tokens_used, token_budget) / max(token_budget, 1), 4)
+
+    result = {
         "narrative": narrative,
         "references": references,
         "token_budget": token_budget,
@@ -378,3 +414,19 @@ def synthesize_narrative(
         "ordering": "topological" if len(results) > 1 else "single",
         "complexity": INTENT_COMPLEXITY.get(primary_intent, "simple"),
     }
+
+    if priority == "critical":
+        # P2-6: P0 决策场景 — 不暴露 token_usage_ratio，防止 agent 草率决策
+        pass  # omit token_usage_ratio
+    elif priority == "low":
+        # P2-6: 低优先级 — ratio > 0.6 时提示收尾
+        result["token_usage_ratio"] = usage_ratio
+        if usage_ratio > 0.6:
+            result["budget_warning"] = (
+                f"⚠️ Token 使用率已达 {usage_ratio:.0%}，建议精简回复内容。"
+            )
+    else:
+        # normal — 正常返回
+        result["token_usage_ratio"] = usage_ratio
+
+    return result

@@ -69,6 +69,7 @@ async def list_tools() -> List[Tool]:
                         "description": "Optional filters such as agent_id, source, session_key, label, or current_agent_id.",
                         "additionalProperties": True,
                     },
+                    "priority": {"type": "string", "enum": ["critical", "normal", "low"], "description": "P2-6: Query priority level. critical=hide token_usage (P0 decisions), normal=default, low=warn at 60% budget", "default": "normal"},
                 },
                 "required": ["query"],
             },
@@ -108,6 +109,7 @@ async def list_tools() -> List[Tool]:
                 "properties": {
                     "label": {"type": "string", "description": "Filter by node label (optional)"},
                     "limit": {"type": "integer", "description": "Max nodes to return (default 100)", "default": 100},
+                    "importance_label": {"type": "string", "enum": ["critical", "useful", "reference", "noise"], "description": "Filter by importance label (optional)"},
                 },
             },
         ),
@@ -131,6 +133,7 @@ async def list_tools() -> List[Tool]:
                     "event_id": {"type": "string", "description": "The recall event ID"},
                     "recalled": {"type": "array", "items": {"type": "string"}, "description": "List of recalled node IDs"},
                     "used": {"type": "array", "items": {"type": "string"}, "description": "List of node IDs that were actually useful"},
+                    "missed_node_ids": {"type": "array", "items": {"type": "string"}, "description": "List of recalled but unused node IDs that should have been used (protection signal)"},
                     "query": {"type": "string", "description": "Original query (optional)"},
                 },
                 "required": ["event_id", "recalled", "used"],
@@ -209,6 +212,7 @@ async def list_tools() -> List[Tool]:
                 "properties": {
                     "node_id": {"type": "string", "description": "The node ID to update"},
                     "properties": {"type": "object", "description": "Properties to merge/update", "additionalProperties": True},
+                    "importance_label": {"type": "string", "enum": ["critical", "useful", "reference", "noise"], "description": "Semantic importance label (optional). Maps to importance value automatically."},
                 },
                 "required": ["node_id", "properties"],
             },
@@ -356,6 +360,19 @@ async def list_tools() -> List[Tool]:
                 "properties": {},
             },
         ),
+        # --- P1-3: Verify tool ---
+        Tool(
+            name="magma_verify",
+            description="Verify a claim against specified memory nodes using LLM. Returns verdict, evidence, and confidence.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node_ids": {"type": "array", "items": {"type": "string"}, "description": "List of node IDs to verify against"},
+                    "claim": {"type": "string", "description": "The claim to verify"},
+                },
+                "required": ["node_ids", "claim"],
+            },
+        ),
     ]
 
 
@@ -412,6 +429,8 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> List[TextContent]:
             return await _handle_entity_remove(arguments)
         elif name == "magma_entity_list":
             return await _handle_entity_list(arguments)
+        elif name == "magma_verify":
+            return await _handle_verify(arguments)
         else:
             return [TextContent(type="text", text=f"Unknown tool: {name}")]
     except Exception as e:
@@ -425,6 +444,7 @@ async def _handle_query(args: Dict[str, Any]) -> List[TextContent]:
         "query": args["query"],
         "top_k": args.get("top_k", 5),
         "filters": args.get("filters"),
+        "priority": args.get("priority", "normal"),
     })
     results = result.get("results", result)
     if not results:
@@ -436,8 +456,14 @@ async def _handle_query(args: Dict[str, Any]) -> List[TextContent]:
         "references": result.get("references"),
         "token_budget": result.get("token_budget"),
         "tokens_used": result.get("tokens_used"),
+        "token_usage_ratio": result.get("token_usage_ratio"),
+        "budget_warning": result.get("budget_warning"),  # P2-6
+        "backtrack_warning": result.get("backtrack_warning"),  # P2-5
+        "backtrack_narrative": result.get("backtrack_narrative"),  # P2-5
         "count": result.get("count", len(results)),
         "intent": result.get("intent"),
+        "active_context": result.get("active_context"),
+        "bridge_entities": result.get("bridge_entities"),
     }
     return [TextContent(type="text", text=json.dumps(output, ensure_ascii=False, indent=2))]
 
@@ -470,6 +496,9 @@ async def _handle_list_nodes(args: Dict[str, Any]) -> List[TextContent]:
         params.append(("label", args["label"]))
     limit = args.get("limit", 100)
     params.append(("limit", str(limit)))
+    # P0-2: Pass importance_label filter if provided
+    if args.get("importance_label"):
+        params.append(("importance_label", args["importance_label"]))
     query_str = urllib.parse.urlencode(params)
     path = f"/api/v1/nodes?{query_str}" if query_str else "/api/v1/nodes"
     result = _api_request("GET", path)
@@ -494,6 +523,7 @@ async def _handle_feedback(args: Dict[str, Any]) -> List[TextContent]:
         "event_id": args["event_id"],
         "recalled": args.get("recalled", []),
         "used": args.get("used", []),
+        "missed_node_ids": args.get("missed_node_ids", []),
         "query": args.get("query", ""),
     })
     return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
@@ -558,7 +588,11 @@ async def _handle_update_node(args: Dict[str, Any]) -> List[TextContent]:
     """Proxy to PATCH /api/v1/nodes/{node_id}"""
     node_id = urllib.parse.quote(args["node_id"], safe="")
     try:
-        result = _api_request("PATCH", f"/api/v1/nodes/{node_id}", args.get("properties", {}))
+        body = dict(args.get("properties", {}))
+        # P0-2: Pass importance_label if provided at top level
+        if "importance_label" in args:
+            body["importance_label"] = args["importance_label"]
+        result = _api_request("PATCH", f"/api/v1/nodes/{node_id}", body)
         return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
     except RuntimeError as e:
         if "404" in str(e):
@@ -739,6 +773,16 @@ async def _handle_entity_list(args: Dict[str, Any]) -> List[TextContent]:
         return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
     except Exception as e:
         return [TextContent(type="text", text=f"Error listing entities: {e}")]
+
+
+async def _handle_verify(args: Dict[str, Any]) -> List[TextContent]:
+    """Proxy to POST /api/v1/verify"""
+    result = _api_request("POST", "/api/v1/verify", {
+        "node_ids": args["node_ids"],
+        "claim": args["claim"],
+    })
+    return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
+
 
 async def main():
     logger.info(f"MAGMA MCP Server starting (proxy mode -> {API_BASE})")

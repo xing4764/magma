@@ -88,12 +88,12 @@ def _parse_source_agent(session_key: str) -> str:
 # ─── Individual checks ────────────────────────────────────────────
 
 def check_api():
-    """Check 8902 API health."""
+    """Check configured MAGMA API health."""
     try:
         req = urllib.request.Request(f"{API_BASE}/api/v1/health")
         resp = urllib.request.urlopen(req, timeout=TIMEOUT_S)
         data = json.loads(resp.read())
-        return "green", {"status": data.get("status"), "version": data.get("version")}
+        return "green", {"api_base": API_BASE, "status": data.get("status"), "version": data.get("version")}
     except urllib.error.URLError as e:
         return "red", {"error": str(e.reason)}
     except Exception as e:
@@ -212,6 +212,49 @@ def check_recent_capture():
         return "green", detail
     except Exception as e:
         return "red", {"error": f"{type(e).__name__}: {e}"}
+
+
+def check_openclaw_version_guardrail():
+    """Ensure OpenClaw version/upgrade questions hit the operational anchor first."""
+    expected = "ops:openclaw:version-pin-2026-5-20"
+    queries = [
+        "看一下 OpenClaw 最新测试版能不能升级？",
+        "我们用的 5.28？",
+        "OpenClaw 6.1 能不能升级？",
+    ]
+    failures = []
+    samples = []
+    for query in queries:
+        payload = json.dumps({
+            "query": query,
+            "top_k": 3,
+            "filters": {"agent_id": "zhuli"},
+        }, ensure_ascii=False).encode("utf-8")
+        try:
+            req = urllib.request.Request(
+                f"{API_BASE}/api/v1/query",
+                data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=TIMEOUT_S) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+        except Exception as exc:
+            failures.append({"query": query, "error": f"{type(exc).__name__}: {exc}"})
+            continue
+        results = data.get("results") or []
+        top_ids = [item.get("id") for item in results[:3]]
+        samples.append({"query": query, "top_ids": top_ids})
+        if not results or results[0].get("id") != expected:
+            failures.append({"query": query, "top_ids": top_ids, "expected_top_id": expected})
+    detail = {
+        "expected_top_id": expected,
+        "samples": samples,
+    }
+    if failures:
+        detail["failures"] = failures
+        return "yellow", detail
+    return "green", detail
 
 
 def get_capture_stats():
@@ -362,12 +405,13 @@ def assess_overall(checks: dict) -> tuple:
 
 def run_json():
     checks = {
-        "api_8902": check_api(),
+        "api": check_api(),
         "mcp_proxy": check_mcp_proxy(),
         "recall_active": check_recall_active(),
         "feedback_active": check_feedback_active(),
         "embedding_coverage": check_embedding_coverage(),
         "recent_capture": check_recent_capture(),
+        "openclaw_version_guardrail": check_openclaw_version_guardrail(),
     }
     overall, failures, warnings = assess_overall(checks)
     injection = get_agent_injection()
@@ -392,12 +436,13 @@ def run_human():
     print(f"{'='*55}\n")
 
     checks = {
-        "api_8902": check_api(),
+        "api": check_api(),
         "mcp_proxy": check_mcp_proxy(),
         "recall_active": check_recall_active(),
         "feedback_active": check_feedback_active(),
         "embedding_coverage": check_embedding_coverage(),
         "recent_capture": check_recent_capture(),
+        "openclaw_version_guardrail": check_openclaw_version_guardrail(),
     }
 
     emoji = {"green": "🟢", "yellow": "🟡", "red": "🔴"}

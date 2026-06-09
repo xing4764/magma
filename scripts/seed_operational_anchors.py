@@ -10,7 +10,7 @@ import sys
 import urllib.request
 
 
-API_BASE = os.environ.get("MAGMA_API_BASE", "http://127.0.0.1:8902").rstrip("/")
+API_BASE = os.environ.get("MAGMA_API_BASE", "http://127.0.0.1:8904").rstrip("/")
 
 
 ANCHORS = [
@@ -41,7 +41,7 @@ ANCHORS = [
         "properties": {
             "title": "MAGMA health signals and doctor yellow meanings",
             "content": (
-                "MAGMA doctor red/yellow/green: api_8902 checks FastAPI on port 8902; "
+                "MAGMA doctor red/yellow/green: api checks the configured FastAPI base URL; "
                 "mcp_proxy must be http_proxy; recall_active checks recent recall_events; "
                 "feedback_active checks recall_feedback; embedding_coverage must stay near 100%; "
                 "recent_capture yellow means the last automatic capture is older than the 6 hour "
@@ -58,16 +58,17 @@ ANCHORS = [
         },
     },
     {
-        "id": "ops:magma:mcp-proxy-8902",
+        "id": "ops:magma:mcp-proxy-http",
         "label": "topic",
         "properties": {
-            "title": "MAGMA MCP proxy through 8902 main API",
+            "title": "MAGMA MCP proxy through configured main API",
             "content": (
-                "MAGMA MCP was changed to a thin http_proxy to http://127.0.0.1:8902/api/v1. "
+                "MAGMA MCP was changed to a thin http_proxy to the configured FastAPI main API. "
+                "The current production base URL is http://127.0.0.1:8904/api/v1. "
                 "The old MCP path directly loaded MemorySearcher, SQLite, and embeddings in stdio, "
                 "which could cold-load the model, bypass FastAPI governance, and cause timeouts. "
                 "mcp_server.py now proxies magma_query, magma_add_node, magma_add_edge, "
-                "magma_list_nodes, and magma_get_node to the 8902 FastAPI main chain."
+                "magma_list_nodes, and magma_get_node to the FastAPI main chain."
             ),
             "source": "magma_operational_anchor",
             "source_agent_id": "main",
@@ -82,19 +83,24 @@ ANCHORS = [
         "id": "ops:openclaw:version-pin-2026-5-20",
         "label": "topic",
         "properties": {
-            "title": "OpenClaw and Codex version pin",
+            "title": "OpenClaw version and upgrade policy",
             "content": (
-                "OpenClaw and @openclaw/codex are pinned to 2026.5.20. Do not upgrade to 5.22 "
-                "without explicit validation because 5.22 had serious runtime bugs in this setup. "
-                "magma_ops.py repair checks the version pin and RUNBOOK.md records this upgrade rule."
+                "OpenClaw version questions are historical + realtime tasks. Always check MAGMA "
+                "first for local upgrade history, known bad versions, current pin/decision, and "
+                "Gateway restart lessons; then verify npm/GitHub for the latest public version. "
+                "Local history: 5.22 had serious runtime/export bugs in this setup; 5.28 was the "
+                "stable line after compatibility checks; 6.1 upgrade attempts hit issues and must "
+                "be treated cautiously. Upgrade SOP: stop Gateway before npm install, upgrade "
+                "plugins only after main package, restart Gateway, then verify Feishu/Codex/MAGMA. "
+                "Do not answer OpenClaw latest/version/upgrade questions from npm alone."
             ),
             "source": "magma_operational_anchor",
             "source_agent_id": "main",
             "department": "老板",
             "memory_scope": "system",
             "layer": "ops_anchor",
-            "importance": 0.9,
-            "ttl_days": 365,
+            "importance": 1.0,
+            "ttl_days": 3650,
         },
     },
     {
