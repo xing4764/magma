@@ -111,7 +111,7 @@ cp .env.example .env
 | `MAGMA_API_PORT` | API 端口 | `8904` |
 | `MAGMA_API_BASE` | MCP/插件访问 API 的地址 | `http://127.0.0.1:8904` |
 | `MAGMA_DB_PATH` | SQLite 数据库路径 | `./data/magma.db` |
-| `MAGMA_EMBEDDING_MODEL` | Embedding 模型名称或本地路径 | `Qwen/Qwen3-Embedding-0.6B` |
+| `MAGMA_EMBEDDING_MODEL` | Embedding 模型名称或本地路径 | `Qwen/Qwen3-Embedding-4B` |
 | `OPENROUTER_API_KEY` | 慢路径 LLM API Key（Verify 接口依赖） | 空 |
 
 Feature Flag 开关（可选）：
@@ -139,7 +139,7 @@ python -m uvicorn magma.api.server:create_app --factory --host 127.0.0.1 --port 
 如果你希望使用 Qwen3 Embedding 等本地模型，可把 `MAGMA_EMBEDDING_MODEL` 指向本地模型目录，例如：
 
 ```bash
-set MAGMA_EMBEDDING_MODEL=C:\openclaw-magma\models\Qwen\Qwen3-Embedding-0___6B
+set MAGMA_EMBEDDING_MODEL=C:\openclaw-magma\models\Qwen\Qwen3-Embedding-4B
 ```
 
 ### 5. 健康检查
@@ -277,7 +277,7 @@ magma/
     faiss_index.py       # FAISS 向量索引
   search.py              # 混合检索 + RRF + Bridge Entity + Two-Tier + 回溯检测
   context_synthesis.py   # 召回结果合成、Token Budget、Sentence Compress
-  encoder.py             # Embedding 编码器（Qwen3-Embedding-0.6B）
+  encoder.py             # Embedding 编码器（Qwen3-Embedding-4B）
   recall_feedback.py     # 召回反馈闭环
   capture_policy.py      # 写入策略 + MinHash 去重
   l1_distiller.py        # L1 蒸馏 + 质量自动标注
@@ -308,7 +308,7 @@ OpenClaw Agent
   -> MAGMA API
   -> MinHash 内容去重（相似度 > 0.85 合并）
   -> SQLite 节点/边/事件
-  -> Embedding 编码（Qwen3-Embedding-0.6B, 1024 维）
+  -> Embedding 编码（Qwen3-Embedding-4B, 2560 维）
   -> FAISS 索引
   -> L1 distill 时自动标注 importance_label
 ```

@@ -1,0 +1,6 @@
+[12:56:47] Simple re-encode: one node at a time
+[12:56:47] Remaining: 4688
+[12:56:47] Loading model...
+[12:56:53] Model loaded. dim=1024
+[12:59:10] [128/4688 3%] 0.9n/s ETA 81.1min
+[13:01:26] [256/4688 5%] 0.9n/s ETA 78.7min

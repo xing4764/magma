@@ -98,6 +98,71 @@ LIVE_CASES = [
 ]
 
 
+# Operational anchor rules — mirrors openclaw-plugin-magma-recall OPS_ANCHOR_RULES
+OPS_ANCHOR_RULES = [
+    {"id": "ops:magma:model-runtime-2026-05-26", "terms": ["MiniLM", "384", "bge-small", "bge-small-zh", "embedding", "DeepSeek", "OpenRouter", "LLM"]},
+    {"id": "ops:magma:health-signals", "terms": ["recent_capture", "doctor", "yellow", "红黄绿"]},
+    {"id": "ops:magma:mcp-proxy-8902", "terms": ["8902", "mcp", "mcp_proxy", "薄代理", "http_proxy"]},
+    {"id": "ops:openclaw:version-pin-2026-5-20", "terms": [
+        "openclaw", "2026.5.20", "5.20", "5.22", "5.27", "5.28", "6.0", "6.1",
+        "版本", "最新", "测试版", "升级", "更新", "npm", "version pin", "版本 pin", "pin",
+    ]},
+    {"id": "ops:magma:p0-ops-suite", "terms": ["p0", "magma_ops.py", "magma_doctor.py", "runbook", "三件套"]},
+    {"id": "ops:magma:yunying-source-agent", "terms": ["yunying", "source_agent_id", "source_agents", "subagent"]},
+]
+
+
+def anchor_ids_for_query(query: str) -> list:
+    """Find anchor node IDs whose terms match the query."""
+    lower = query.lower()
+    return [
+        rule["id"]
+        for rule in OPS_ANCHOR_RULES
+        if any(term.lower() in lower for term in rule["terms"])
+    ]
+
+
+def fetch_node(node_id: str) -> dict:
+    """Fetch a node by ID from the MAGMA API."""
+    try:
+        url = f"{API_BASE}/api/v1/nodes/{urllib.request.quote(node_id, safe='')}"
+        req = urllib.request.Request(url)
+        with urllib.request.urlopen(req, timeout=10) as res:
+            body = json.loads(res.read().decode("utf-8"))
+            return body.get("node") or {}
+    except Exception:
+        return {}
+
+
+def inject_anchors(query: str, results: list, top_k: int) -> list:
+    """Inject operational anchor nodes into results (mirrors plugin behavior)."""
+    merged = list(results)
+    seen = {item.get("id") for item in merged}
+    for anchor_id in anchor_ids_for_query(query):
+        if anchor_id in seen:
+            continue
+        node = fetch_node(anchor_id)
+        if not node:
+            continue
+        merged.insert(0, {
+            **node,
+            "score": 1.25,
+            "semantic_score": 0,
+            "keyword_score": 1.25,
+            "retrieval_source": "operational_anchor",
+            "memory_scope": (node.get("properties") or {}).get("memory_scope", "system"),
+            "provenance": {
+                "agent_id": node.get("source_agent_id") or (node.get("properties") or {}).get("source_agent_id"),
+                "source": (node.get("properties") or {}).get("source"),
+                "layer": (node.get("properties") or {}).get("layer"),
+            },
+            "source_agent_id": node.get("source_agent_id") or (node.get("properties") or {}).get("source_agent_id"),
+            "memory_source": (node.get("properties") or {}).get("source"),
+        })
+        seen.add(anchor_id)
+    return merged[:top_k]
+
+
 def post_query(query: str, top_k: int) -> list:
     payload = {
         "query": query,
@@ -121,7 +186,9 @@ def post_query(query: str, top_k: int) -> list:
     )
     with urllib.request.urlopen(req, timeout=30) as res:
         body = json.loads(res.read().decode("utf-8"))
-    return body.get("results") or []
+    raw_results = body.get("results") or []
+    # Inject operational anchors (mirrors plugin behavior)
+    return inject_anchors(query, raw_results, top_k)
 
 
 def direct_result_text(result: dict) -> str:

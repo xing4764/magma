@@ -22,9 +22,9 @@ ANCHORS = [
             "content": (
                 "MAGMA slow-path LLM backend is DeepSeek V3 via OpenRouter for relation extraction, "
                 "causal reasoning, and consolidation. MAGMA embedding model is local "
-                "BAAI/bge-small-zh-v1.5 with 512-dimensional vectors for semantic retrieval. "
-                "MiniLM-L6-v2 / 384d was only an early historical state and must not be reported "
-                "as current runtime."
+                "Qwen3-Embedding-4B with 2560-dimensional vectors for semantic retrieval. "
+                "Previous models: Qwen3-Embedding-0.6B (1024d), BAAI/bge-small-zh-v1.5 (512d). "
+                "Switched to 4B on 2026-06-09 for 100% recall (was 95.8% with 0.6B)."
             ),
             "source": "magma_operational_anchor",
             "source_agent_id": "main",

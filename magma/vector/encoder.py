@@ -9,7 +9,7 @@ from typing import List, Union
 os.environ.setdefault("HF_ENDPOINT", "https://huggingface.co")
 
 _models = {}
-_LOCAL_QWEN = str(Path(__file__).parent.parent.parent / "models" / "Qwen" / "Qwen3-Embedding-0___6B")
+_LOCAL_QWEN = str(Path(__file__).parent.parent.parent / "models" / "Qwen" / "Qwen3-Embedding-4B")
 _MODEL_NAME = os.environ.get("MAGMA_EMBEDDING_MODEL", _LOCAL_QWEN)
 
 

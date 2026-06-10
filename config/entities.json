@@ -24,7 +24,7 @@
   },
   "patterns": {
     "sku": "\\b[A-Z]{1,4}\\d{2,6}\\b",
-    "model": "\\b(?:bge-small-zh-v1\\.5|MiniLM-L6-v2|text2vec-base-chinese)\\b"
+    "model": "\\b(?:Qwen3-Embedding-4B|Qwen3-Embedding-0\\.6B|bge-small-zh-v1\\.5|MiniLM-L6-v2|text2vec-base-chinese)\\b"
   },
   "custom_entities_file": "config/custom_entities.json"
 }

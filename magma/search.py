@@ -249,6 +249,7 @@ OPERATIONAL_KEYWORDS = (
     "http_proxy",
     "runbook.md",
     "bge-small-zh-v1.5",
+    "Qwen3-Embedding-4B",
     "qwen3",
     "reranker",
 )
