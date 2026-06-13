@@ -360,6 +360,19 @@ async def list_tools() -> List[Tool]:
                 "properties": {},
             },
         ),
+        Tool(
+            name="magma_decision_drift",
+            description="List recent decision-particle events and summarize whether user choices drifted over time.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "agent_id": {"type": "string", "description": "Optional agent/source filter"},
+                    "session_key": {"type": "string", "description": "Optional session filter"},
+                    "decision_key": {"type": "string", "description": "Optional decision key filter"},
+                    "limit": {"type": "integer", "description": "Max events to inspect (default 50)", "default": 50},
+                },
+            },
+        ),
         # --- P1-3: Verify tool ---
         Tool(
             name="magma_verify",
@@ -429,6 +442,8 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> List[TextContent]:
             return await _handle_entity_remove(arguments)
         elif name == "magma_entity_list":
             return await _handle_entity_list(arguments)
+        elif name == "magma_decision_drift":
+            return await _handle_decision_drift(arguments)
         elif name == "magma_verify":
             return await _handle_verify(arguments)
         else:
@@ -452,6 +467,7 @@ async def _handle_query(args: Dict[str, Any]) -> List[TextContent]:
     # P2: Include narrative and references in MCP output
     output = {
         "results": results,
+        "event_id": result.get("event_id"),
         "narrative": result.get("narrative"),
         "references": result.get("references"),
         "token_budget": result.get("token_budget"),
@@ -773,6 +789,21 @@ async def _handle_entity_list(args: Dict[str, Any]) -> List[TextContent]:
         return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
     except Exception as e:
         return [TextContent(type="text", text=f"Error listing entities: {e}")]
+
+
+async def _handle_decision_drift(args: Dict[str, Any]) -> List[TextContent]:
+    """Proxy to GET /api/v1/decisions/drift"""
+    params = {
+        "agent_id": args.get("agent_id"),
+        "session_key": args.get("session_key"),
+        "decision_key": args.get("decision_key"),
+        "limit": args.get("limit", 50),
+    }
+    params = {k: v for k, v in params.items() if v is not None}
+    query_str = urllib.parse.urlencode(params)
+    path = f"/api/v1/decisions/drift?{query_str}" if query_str else "/api/v1/decisions/drift"
+    result = _api_request("GET", path)
+    return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
 
 
 async def _handle_verify(args: Dict[str, Any]) -> List[TextContent]:

@@ -7,6 +7,72 @@ const TAG = "[magma-recall]";
 const STRIP_RE = /<magma-memories>[\s\S]*?<\/magma-memories>\s*/g;
 const PROMPT_CACHE_TTL_MS = 10 * 60 * 1000;
 const PROMPT_CACHE_MAX_SIZE = 1000;
+
+// ===== Self-correction patterns (strong only, avoid false positives) =====
+const CORRECTION_PATTERNS = [
+  // Chinese: explicit self-correction
+  { pattern: /我之前说错了/, type: "self_correction" },
+  { pattern: /更正[:：]\s*(.+)/, type: "explicit" },
+  { pattern: /修正[:：]\s*(.+)/, type: "explicit" },
+  { pattern: /纠正[:：]\s*(.+)/, type: "explicit" },
+  // Chinese: negation + affirmation ("不是X，是Y")
+  { pattern: /不是(.{1,30})[，,](?:\s*)是(.+)/, type: "correction" },
+  { pattern: /不是(.{1,30})[。.](?:\s*)是(.+)/, type: "correction" },
+  // English: explicit self-correction
+  { pattern: /i was wrong/i, type: "self_correction" },
+  { pattern: /correction[:：]\s*(.+)/i, type: "explicit" },
+];
+
+function detectCorrections(text) {
+  const str = String(text || "");
+  if (!str.trim()) return [];
+  const corrections = [];
+  for (const { pattern, type } of CORRECTION_PATTERNS) {
+    const match = str.match(pattern);
+    if (match) {
+      corrections.push({
+        type,
+        correctedContent: match[2] || match[1] || match[0],
+        fullMatch: match[0],
+      });
+    }
+  }
+  return corrections;
+}
+
+function extractCorrectionQuery(assistantText, correction) {
+  // For "不是X，是Y" pattern, X is the wrong content to search for
+  if (correction.type === "correction") {
+    const negMatch = assistantText.match(/不是(.{1,30})[，,。.]/);
+    if (negMatch) return negMatch[1].trim();
+  }
+  // For explicit corrections (更正/修正/纠正), look for "不是X" in the full text
+  if (correction.type === "explicit") {
+    const negMatch = assistantText.match(/不是(.{1,30})[，,。.]/);
+    if (negMatch) return negMatch[1].trim();
+    return correction.correctedContent;
+  }
+  // For self_correction, look for context before the pattern
+  const beforeMatch = assistantText.match(/之前.{0,20}(说|认为|提到)(.{0,60})/);
+  if (beforeMatch) return beforeMatch[2].trim();
+  // Fallback: use the full correction content
+  return correction.correctedContent;
+}
+
+function matchRecalledMemories(recalls, query) {
+  if (!query || !Array.isArray(recalls) || recalls.length === 0) return [];
+  const queryTerms = query.split(/[\s,，。；;:：|/\\()[\]{}]+/).filter(t => t.length >= 2);
+  if (queryTerms.length === 0) return [];
+  return recalls.filter((result) => {
+    const props = result.properties || {};
+    const searchable = [
+      props.content, props.message, props.title, props.name,
+      result.label, result.id,
+      ...(Array.isArray(props.entities) ? props.entities.map(e => e?.name) : []),
+    ].filter(Boolean).join(" ");
+    return queryTerms.some(term => searchable.includes(term));
+  });
+}
 const PLUGIN_DIR = path.dirname(fileURLToPath(import.meta.url));
 const DEFAULT_MAGMA_CWD = path.resolve(PLUGIN_DIR, "..");
 const OPS_ANCHOR_RULES = [
@@ -53,6 +119,11 @@ function resolveConfig(raw = {}) {
     captureEnabled: raw.capture?.enabled !== false,
     captureTtlDays: Number.isFinite(raw.capture?.ttlDays) ? Math.max(1, Math.floor(raw.capture.ttlDays)) : 180,
     captureMaxChars: Number.isFinite(raw.capture?.maxChars) ? Math.max(200, Math.floor(raw.capture.maxChars)) : 4000,
+    autoCorrection: {
+      enabled: raw.autoCorrection?.enabled !== false,
+      minScoreToMarkWrong: Number.isFinite(raw.autoCorrection?.minScoreToMarkWrong)
+        ? raw.autoCorrection.minScoreToMarkWrong : 0.5,
+    },
     autoStartApi: raw.autoStartApi !== false,
     python: String(raw.python || "python"),
     magmaCwd: String(raw.magmaCwd || DEFAULT_MAGMA_CWD),
@@ -655,6 +726,56 @@ export default function register(api) {
             used: used.map((item) => ({ id: item.id })),
           });
         }
+        // ===== Self-correction detection =====
+        if (cfg.autoCorrection.enabled && assistantText && recallBatch) {
+          const corrections = detectCorrections(assistantText);
+          if (corrections.length > 0) {
+            api.logger.info?.(`${TAG} detected ${corrections.length} correction(s) in assistant text`);
+            for (const correction of corrections) {
+              const query = extractCorrectionQuery(assistantText, correction);
+              if (!query) continue;
+              const matched = matchRecalledMemories(recallBatch.results, query);
+              for (const mem of matched) {
+                if (typeof mem.score === "number" && mem.score < cfg.autoCorrection.minScoreToMarkWrong) continue;
+                try {
+                  const markResult = await fetchWithTimeout(
+                    `${cfg.apiBaseUrl}/api/v1/memory/mark_wrong`,
+                    {
+                      method: "POST",
+                      headers: { "Content-Type": "application/json" },
+                      body: JSON.stringify({
+                        node_id: mem.id,
+                        reason: `Auto-correction detected: ${correction.type} | match: "${correction.fullMatch}"`,
+                        agent_id: agentId || undefined,
+                        session_key: ctx?.sessionKey || undefined,
+                      }),
+                    },
+                    cfg.timeoutMs,
+                  );
+                  if (markResult.ok) {
+                    api.logger.info?.(`${TAG} auto-marked wrong: ${mem.id} (score=${mem.score}, type=${correction.type})`);
+                  } else {
+                    api.logger.warn?.(`${TAG} failed to mark wrong: ${mem.id} HTTP ${markResult.status}`);
+                  }
+                  writeAudit(cfg, {
+                    type: "auto_correction",
+                    agentId,
+                    sessionKey: ctx?.sessionKey,
+                    correctionType: correction.type,
+                    correctionMatch: correction.fullMatch,
+                    queryUsed: query,
+                    matchedNodeId: mem.id,
+                    matchedScore: mem.score,
+                    markSuccess: markResult.ok,
+                  });
+                } catch (markErr) {
+                  api.logger.warn?.(`${TAG} error marking wrong ${mem.id}: ${markErr instanceof Error ? markErr.message : String(markErr)}`);
+                }
+              }
+            }
+          }
+        }
+
         const result = await captureMagma(cfg, {
           user_text: userText,
           assistant_text: assistantText,

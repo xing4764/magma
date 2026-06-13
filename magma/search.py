@@ -610,6 +610,23 @@ def _embedding_from_blob(blob: Optional[bytes], expected_dim: int) -> Optional[n
     return vec
 
 
+def _parse_iso_datetime(value: str) -> Optional[str]:
+    """Parse ISO date string to SQLite-compatible datetime string."""
+    if not value:
+        return None
+    try:
+        from datetime import datetime
+        for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"):
+            try:
+                dt = datetime.strptime(value, fmt)
+                return dt.strftime("%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                continue
+        return None
+    except Exception:
+        return None
+
+
 def _property_filters(filters: Dict[str, Any]) -> Dict[str, Any]:
     supported = {}
     for key in ("agent_id", "source", "session_key", "session_id", "role", "layer", "memory_scope"):
@@ -621,6 +638,18 @@ def _property_filters(filters: Dict[str, Any]) -> Dict[str, Any]:
         if value is not None:
             supported[key] = value
     return supported
+
+
+def _time_range_filters(filters: Dict[str, Any]) -> Dict[str, Optional[str]]:
+    """Extract created_after/created_before from filters, parse to SQLite datetime."""
+    result: Dict[str, Optional[str]] = {}
+    for key in ("created_after", "created_before"):
+        raw = filters.get(key)
+        if raw is not None:
+            parsed = _parse_iso_datetime(str(raw))
+            if parsed is not None:
+                result[key] = parsed
+    return result
 
 
 def _provenance(node: Dict[str, Any]) -> Dict[str, Any]:
@@ -1150,6 +1179,7 @@ class MemorySearcher:
         label = filters.get("label")
         pool_size = int(filters.get("pool_size", 99999))
         property_filters = _property_filters(filters)
+        time_range = _time_range_filters(filters)
         # --- P0-1: Feature Flag guards ---
         if MAGMA_FEATURE_INTENT_ROUTING:
             intent = filters.get("intent") or classify_intent(query)
@@ -1199,6 +1229,7 @@ class MemorySearcher:
                 limit=pool_size,
                 include_archived=include_archived,
                 property_filters=property_filters,
+                time_filters=time_range,
             )
         else:
             nodes = self.store.query_nodes_with_embeddings(
@@ -1206,6 +1237,7 @@ class MemorySearcher:
                 limit=pool_size,
                 include_archived=include_archived,
                 property_filters=property_filters,
+                time_filters=time_range,
             )
 
         # --- Batch decode embeddings + batch cosine (fallback or complement) ---

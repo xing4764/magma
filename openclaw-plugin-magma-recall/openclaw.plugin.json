@@ -76,6 +76,20 @@
           "type": "string"
         },
         "default": []
+      },
+      "autoCorrection": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "default": true
+          },
+          "minScoreToMarkWrong": {
+            "type": "number",
+            "default": 0.5
+          }
+        }
       }
     }
   }

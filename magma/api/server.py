@@ -7,6 +7,7 @@ import logging
 import os
 import sys
 import time
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -117,6 +118,47 @@ def _capture_importance(role: str, text: str) -> float:
     return 0.36
 
 
+def _decision_event_payload(req, event: dict) -> tuple[str, str, dict]:
+    content = event.get("content") or ""
+    digest = hashlib.sha1(
+        "\n".join([
+            req.source,
+            req.agent_id or "",
+            req.session_key or "",
+            event.get("decision_key") or "",
+            event.get("selected") or "",
+            content,
+        ]).encode("utf-8")
+    ).hexdigest()[:16]
+    node_id = f"decision:{digest}"
+    text_for_embedding = (
+        f"decision {event.get('decision_key')}: selected {event.get('selected')}; "
+        f"options {', '.join(event.get('options') or [])}; {content}"
+    )
+    properties = {
+        "layer": "L2",
+        "kind": "decision_event",
+        "source": "decision_particles",
+        "role": "decision",
+        "content": content,
+        "decision_key": event.get("decision_key"),
+        "options": event.get("options") or [],
+        "selected": event.get("selected"),
+        "chain": event.get("chain") or [],
+        "direction": event.get("direction"),
+        "confidence": event.get("confidence"),
+        "tags": event.get("tags") or [],
+        "agent_id": req.agent_id,
+        "session_key": req.session_key,
+        "session_id": getattr(req, "session_id", None),
+        "ttl_days": max(int(getattr(req, "ttl_days", 180) or 180), 180),
+        "importance": 0.68,
+        "source_agent_id": _parse_source_agent(req.session_key) or req.agent_id,
+        "department": DEPT_MAP.get(_parse_source_agent(req.session_key) or req.agent_id or "", ""),
+    }
+    return node_id, text_for_embedding, properties
+
+
 class QueryRequest(BaseModel):
     query: str
     top_k: int = 5
@@ -164,6 +206,7 @@ class QueryResponse(BaseModel):
     query: str
     results: list
     count: int
+    event_id: Optional[str] = None
     intent: Optional[dict] = None
     narrative: Optional[str] = None
     references: Optional[list] = None
@@ -188,6 +231,12 @@ class FeedbackRequest(BaseModel):
     missed_node_ids: list = []
     positive_delta: float = 0.05
     unused_delta: float = -0.01
+
+
+class DecisionDriftResponse(BaseModel):
+    events: list
+    summary: dict
+    count: int
 
 
 class ExplainRecallRequest(BaseModel):
@@ -442,7 +491,7 @@ def create_app() -> FastAPI:
                 # Reconstruct bridge entities from all results
                 ent_map = {}
                 for r in results:
-                    props = r.get("properties", {}) or {}
+                    props = r.get("properties") or {}
                     entities = props.get("entities", [])
                     if isinstance(entities, list):
                         for ent in entities:
@@ -456,10 +505,36 @@ def create_app() -> FastAPI:
                     for name, nids in ent_map.items() if len(nids) >= 2
                 ]
 
+        event_id = f"recall-{uuid.uuid4().hex}"
+        try:
+            recall_results = [
+                {"id": r.get("id"), "score": r.get("score", 0), "label": r.get("label", "")}
+                for r in results if r.get("id") != "system"
+            ]
+            session_key = filters.get("session_key") or filters.get("session_id") or ""
+            source_agent = (
+                filters.get("current_agent_id")
+                or filters.get("agent_id")
+                or _parse_source_agent(session_key)
+                or ""
+            )
+            store.record_recall_event(
+                event_id=event_id,
+                query=req.query,
+                agent_id=source_agent,
+                session_key=session_key,
+                results=recall_results,
+                source_agent_id=source_agent,
+                department=DEPT_MAP.get(source_agent, ""),
+            )
+        except Exception as e:
+            logger.warning(f"Failed to record recall_event: {e}")
+
         return QueryResponse(
             query=req.query,
             results=results,
             count=len(results),
+            event_id=event_id,
             intent=intent,
             narrative=narrative_data.get("narrative") if narrative_data else None,
             references=narrative_data.get("references") if narrative_data else None,
@@ -613,10 +688,41 @@ def create_app() -> FastAPI:
                 "session_key": req.session_key,
             })
 
+        decisions_written = []
+        try:
+            from magma.decision_particles import extract_decision_events
+
+            decision_events = await asyncio.to_thread(
+                extract_decision_events,
+                req.user_text,
+                req.assistant_text,
+            )
+            faiss_index = getattr(app.state, "faiss_index", None)
+            for event in decision_events:
+                node_id, text_for_embedding, properties = _decision_event_payload(req, event)
+                properties.update(await asyncio.to_thread(_memory_metadata, text_for_embedding))
+                embedding = await asyncio.to_thread(encoder.encode, text_for_embedding)
+                embedding = embedding.astype("float32")
+                await asyncio.to_thread(store.add_node, node_id, "decision_event", properties, embedding)
+                for evt_id in written:
+                    await asyncio.to_thread(store.add_edge_once, evt_id, node_id, "expresses_decision", {
+                        "source": req.source,
+                        "decision_key": event.get("decision_key"),
+                    })
+                if faiss_index and embedding is not None:
+                    try:
+                        await asyncio.to_thread(faiss_index.add, node_id, embedding)
+                    except Exception as e:
+                        logger.warning(f"FAISS incremental add for decision event failed: {e}")
+                decisions_written.append(node_id)
+        except Exception as e:
+            logger.warning(f"Decision-particle extraction failed (non-fatal): {e}")
+
         # --- P0-1: Fact Extraction (background, non-blocking) ---
         # Run fact extraction as background task so capture returns immediately
         extract_facts_fn, is_available_fn = _get_fact_extractor()
         if is_available_fn() and written:
+            faiss_index = getattr(app.state, "faiss_index", None)
             asyncio.create_task(_extract_facts_background(
                 req, written, encoder, store, faiss_index, extract_facts_fn
             ))
@@ -625,6 +731,8 @@ def create_app() -> FastAPI:
             "status": "ok",
             "written": written,
             "count": len(written),
+            "decisions_written": decisions_written,
+            "decision_count": len(decisions_written),
             "capture_decision": {
                 "strength": capture_decision.strength,
                 "reasons": capture_decision.reasons,
@@ -797,6 +905,48 @@ def create_app() -> FastAPI:
         for n in nodes:
             n["importance_label"] = importance_label_from_value(float(n.get("importance") or 0.5))
         return {"nodes": nodes, "count": len(nodes)}
+
+    @app.get("/api/v1/decisions/drift", response_model=DecisionDriftResponse)
+    async def decision_drift(
+        agent_id: Optional[str] = None,
+        session_key: Optional[str] = None,
+        decision_key: Optional[str] = None,
+        limit: int = 50,
+    ):
+        from magma.decision_particles import summarize_decision_drift
+        from magma.graph.sqlite_store import get_store
+
+        store = getattr(app.state, "store", None) or get_store()
+        nodes = await asyncio.to_thread(
+            store.get_decision_events,
+            agent_id,
+            session_key,
+            decision_key,
+            limit,
+        )
+        events = []
+        for node in nodes:
+            props = node.get("properties", {}) or {}
+            event = {
+                "id": node.get("id"),
+                "created_at": node.get("created_at"),
+                "decision_key": props.get("decision_key"),
+                "selected": props.get("selected"),
+                "options": props.get("options") or [],
+                "chain": props.get("chain") or [],
+                "direction": props.get("direction"),
+                "confidence": props.get("confidence"),
+                "tags": props.get("tags") or [],
+                "content": props.get("content"),
+                "agent_id": props.get("agent_id"),
+                "session_key": props.get("session_key"),
+            }
+            events.append(event)
+        return {
+            "events": events,
+            "summary": summarize_decision_drift(events),
+            "count": len(events),
+        }
 
     @app.get("/api/v1/nodes/{node_id}")
     async def get_node(node_id: str):
@@ -1016,17 +1166,25 @@ def create_app() -> FastAPI:
         from magma.graph.sqlite_store import get_store
 
         store = getattr(app.state, "store", None) or get_store()
-        source_agent = _parse_source_agent(req.session_key) or req.agent_id or ""
-        dept = DEPT_MAP.get(source_agent, "")
-        store.record_recall_event(
-            event_id=req.event_id,
-            query=req.query,
-            agent_id=req.agent_id,
-            session_key=req.session_key,
-            results=req.recalled,
-            source_agent_id=source_agent,
-            department=dept,
+        existing_event = store.get_recall_event(req.event_id)
+        source_agent = (
+            _parse_source_agent(req.session_key)
+            or req.agent_id
+            or (existing_event or {}).get("source_agent_id")
+            or (existing_event or {}).get("agent_id")
+            or ""
         )
+        dept = DEPT_MAP.get(source_agent, "") or (existing_event or {}).get("department")
+        if existing_event is None:
+            store.record_recall_event(
+                event_id=req.event_id,
+                query=req.query,
+                agent_id=req.agent_id,
+                session_key=req.session_key,
+                results=req.recalled,
+                source_agent_id=source_agent,
+                department=dept,
+            )
         recalled_ids = [
             item.get("id") if isinstance(item, dict) else item
             for item in (req.recalled or [])

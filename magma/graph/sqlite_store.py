@@ -317,6 +317,7 @@ class SQLiteStore:
         limit: int = 1000,
         include_archived: bool = False,
         property_filters: Dict[str, Any] = None,
+        time_filters: Dict[str, str] = None,
     ) -> List[Dict]:
         where = []
         params = []
@@ -342,6 +343,13 @@ class SQLiteStore:
             else:
                 where.append(f"json_extract(properties, '$.{key}') = ?")
                 params.append(value)
+        if time_filters:
+            if time_filters.get("created_after"):
+                where.append("created_at >= ?")
+                params.append(time_filters["created_after"])
+            if time_filters.get("created_before"):
+                where.append("created_at <= ?")
+                params.append(time_filters["created_before"])
         where_sql = " AND ".join(where) if where else "1 = 1"
         params.append(limit)
         cur = self._conn.execute(
@@ -369,6 +377,7 @@ class SQLiteStore:
         limit: int = 1000,
         include_archived: bool = False,
         property_filters: Dict[str, Any] = None,
+        time_filters: Dict[str, str] = None,
     ) -> List[Dict]:
         """Query nodes WITHOUT loading embedding BLOBs (faster when FAISS provides semantics)."""
         where = []
@@ -395,6 +404,13 @@ class SQLiteStore:
             else:
                 where.append(f"json_extract(properties, '$.{key}') = ?")
                 params.append(value)
+        if time_filters:
+            if time_filters.get("created_after"):
+                where.append("created_at >= ?")
+                params.append(time_filters["created_after"])
+            if time_filters.get("created_before"):
+                where.append("created_at <= ?")
+                params.append(time_filters["created_before"])
         where_sql = " AND ".join(where) if where else "1 = 1"
         params.append(limit)
         cur = self._conn.execute(
@@ -623,7 +639,7 @@ class SQLiteStore:
             return {"status": "not_found", "node_id": node_id}
         props = dict(node.get("properties") or {})
         old_importance = float(node.get("importance") or props.get("importance") or 0.5)
-        new_importance = max(old_importance - 0.25, 0.05)
+        new_importance = max(min(old_importance, 0.15), 0.05)
         props.update({
             "status": "suppressed",
             "suppressed": True,
@@ -1505,6 +1521,44 @@ class SQLiteStore:
              LIMIT ?
         """, tuple(params))
 
+        return [self._row_to_node(r) for r in cur.fetchall()]
+
+    def get_decision_events(
+        self,
+        agent_id: str = None,
+        session_key: str = None,
+        decision_key: str = None,
+        limit: int = 50,
+    ) -> List[Dict]:
+        """Get recent L2 decision-particle events."""
+        where = [
+            "label = 'decision_event'",
+            "status != 'deleted'",
+            "json_extract(properties, '$.kind') = 'decision_event'",
+        ]
+        params = []
+
+        if agent_id:
+            where.append("(source_agent_id = ? OR json_extract(properties, '$.agent_id') = ?)")
+            params.extend([agent_id, agent_id])
+        if session_key:
+            where.append("json_extract(properties, '$.session_key') = ?")
+            params.append(session_key)
+        if decision_key:
+            where.append("json_extract(properties, '$.decision_key') = ?")
+            params.append(decision_key)
+
+        params.append(max(1, min(int(limit or 50), 200)))
+        where_sql = " AND ".join(where)
+        cur = self._conn.execute(f"""
+            SELECT id, label, properties, created_at, updated_at,
+                   last_accessed_at, access_count, importance, ttl_days,
+                   valid_from, valid_until, status, source_agent_id, department
+              FROM nodes
+             WHERE {where_sql}
+             ORDER BY datetime(created_at) DESC
+             LIMIT ?
+        """, tuple(params))
         return [self._row_to_node(r) for r in cur.fetchall()]
 
     def close(self):

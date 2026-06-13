@@ -130,6 +130,27 @@ LOW_VALUE_PATTERNS = (
     r"^全部字段\s*[✅。！!,.，\s]*(验收通过)?[。！!,.，\s]*$",
 )
 
+ARTIFACT_PATTERNS = (
+    # Memory-core dreaming output should not become stable operational memory.
+    r"\bwrite a dream diary entry from these memory fragments\b",
+    r"\bhere is a dream diary entry woven from those fragments\b",
+    r"\bdreaming[-_\s]narrative\b",
+    # Feishu/OpenClaw transport wrappers are metadata, not the user fact.
+    r"^\[message_id:\s*om_[^\]]+\]",
+    r"\[System:\s*The content may include mention tags",
+    r"<at\s+user_id=",
+    r"\bou_[0-9a-f]{16,}:",
+    # Runtime/session envelope text.
+    r"^\[Inter-session message\]",
+    r"^\[Subagent Context\]",
+    r"^Note:\s*The previous agent run was aborted",
+    # Tool/trajectory JSON fragments.
+    r'"toolCallId"\s*:',
+    r'"toolName"\s*:',
+    r'"traceSchema"\s*:\s*"openclaw-trajectory"',
+    r'"sessionFile"\s*:',
+)
+
 SUBSTANCE_TERMS = (
     "MAGMA",
     "OpenClaw",
@@ -195,6 +216,8 @@ def _is_noise(text: str) -> bool:
         return True
     if any(marker in text for marker in NOISE_MARKERS):
         return True
+    if _is_artifact_text(text):
+        return True
     if any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in LOW_VALUE_PATTERNS):
         return True
     # Pure punctuation / whitespace / emoji only
@@ -202,6 +225,11 @@ def _is_noise(text: str) -> bool:
     if len(stripped) < 8:
         return True
     return classify_capture(text, "").should_capture is False
+
+
+def _is_artifact_text(text: str) -> bool:
+    """Return True for transport/runtime/dreaming artifacts that should never enter L1."""
+    return any(re.search(pattern, text or "", flags=re.IGNORECASE) for pattern in ARTIFACT_PATTERNS)
 
 
 def _has_substance(text: str, kind: str) -> bool:
