@@ -90,7 +90,10 @@ Use `source_agent_id` and `department` for cross-agent filtering, QA, and memory
 
 The realtime recall path must stay fast because it runs before prompt build:
 
-- Keep `Qwen3-Embedding-4B` as the production first-stage embedding model. Production embeddings should be 2560-dimensional; if they are 512/1024-dimensional, rerun `magma_cli.py reembed` or `scripts/re_encode_embeddings_4b.py` with the configured Qwen 4B model.
+- Current production embedding is cloud DashScope `text-embedding-v4` with 2048-dimensional vectors. This is intentional: it avoids loading `Qwen3-Embedding-4B` in local RAM while keeping SQLite and FAISS local.
+- Keep these runtime variables aligned in OpenClaw `magma-recall`, MCP `magma-memory`, and any manual startup script: `MAGMA_EMBEDDING_BACKEND=cloud`, `MAGMA_CLOUD_EMBEDDING_MODEL=text-embedding-v4`, `MAGMA_CLOUD_EMBEDDING_DIM=2048`, `MAGMA_FEATURE_LOCAL_RERANKER=0`.
+- Do not reintroduce `MAGMA_EMBEDDING_MODEL=C:\openclaw-magma\models\Qwen\Qwen3-Embedding-4B` into OpenClaw production config unless explicitly switching back to local/offline mode and re-encoding vectors.
+- Local `Qwen3-Embedding-4B` remains the offline fallback. If switching to it, production embeddings must be rebuilt to the local model dimension before serving traffic.
 - Prefer high-density `ops_anchor`, `L1`, `decision`, `fact`, and `current_state` memories for operational questions.
 - Keep L0 raw chat memories as evidence, but do not let generic chat fragments dominate high-signal anchors.
 - Use `scripts/qwen_embedding_probe.py` and `scripts/qwen_reranker_probe.py` for offline A/B tests only.
