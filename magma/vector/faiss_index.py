@@ -2,15 +2,21 @@
 
 Uses IndexFlatIP (inner product) since embeddings are L2-normalized,
 making inner product equivalent to cosine similarity.
+
+Memory optimization: LRU cache for embeddings with configurable max size.
 """
 
 import logging
+import os
 import threading
+from collections import OrderedDict
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
 logger = logging.getLogger("magma.vector.faiss_index")
+
+_MAX_CACHE_SIZE = int(os.environ.get("MAGMA_FAISS_CACHE_MAX", "50000"))
 
 try:
     import faiss
@@ -24,14 +30,16 @@ class FAISSIndex:
     """Thread-safe FAISS index wrapper for MAGMA node embeddings.
 
     SQLite remains the source of truth; FAISS only accelerates vector lookup.
+    Uses LRU cache (OrderedDict) for embeddings with configurable max size.
     """
 
-    def __init__(self, dimension: int = 0):
+    def __init__(self, dimension: int = 0, max_cache_size: int = _MAX_CACHE_SIZE):
         self._dimension = dimension
         self._index = None          # faiss.IndexFlatIP
         self._id_map: List[str] = []  # position -> node_id
         self._id_to_pos: Dict[str, int] = {}
-        self._embeddings: Dict[str, np.ndarray] = {}  # node_id -> embedding (for rebuild)
+        self._embeddings: OrderedDict[str, np.ndarray] = OrderedDict()  # LRU cache
+        self._max_cache_size = max_cache_size
         self._lock = threading.Lock()
         self._built = False
 
@@ -138,6 +146,17 @@ class FAISSIndex:
             self._id_map.append(node_id)
             self._id_to_pos[node_id] = len(self._id_map) - 1
             self._embeddings[node_id] = embedding.astype(np.float32)
+            self._evict_if_needed()
+
+    def _evict_if_needed(self):
+        """Evict oldest entries if cache exceeds max size. Caller must hold lock."""
+        while len(self._embeddings) > self._max_cache_size:
+            evicted_id, _ = self._embeddings.popitem(last=False)
+            # Remove from FAISS index if still present
+            if evicted_id in self._id_to_pos:
+                self._rebuild_without_deleted_locked()
+                logger.debug(f"Evicted {evicted_id} from FAISS cache")
+                break  # Rebuild handles all eviction
 
     def _remove_locked(self, node_id: str):
         """Internal remove (must hold self._lock). Uses rebuild approach."""
@@ -254,10 +273,10 @@ class FAISSIndex:
             self._built = False
 
 
-def get_faiss_index(dimension: int = 0) -> FAISSIndex:
+def get_faiss_index(dimension: int = 0, max_cache_size: int = _MAX_CACHE_SIZE) -> FAISSIndex:
     """Get or create a module-level FAISS index singleton."""
     if not hasattr(get_faiss_index, "_instance"):
-        get_faiss_index._instance = FAISSIndex(dimension)
+        get_faiss_index._instance = FAISSIndex(dimension, max_cache_size)
     elif dimension > 0 and get_faiss_index._instance.dimension == 0:
         get_faiss_index._instance._dimension = dimension
     return get_faiss_index._instance

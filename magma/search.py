@@ -781,7 +781,7 @@ _session_query_history: Dict[str, List[Tuple[float, List[str]]]] = {}  # session
 _BACKTRACK_WINDOW = 3   # Number of recent queries to compare
 _BACKTRACK_THRESHOLD = 0.6  # 60% overlap triggers warning
 _BACKTRACK_HISTORY_TTL = 300  # 5 minutes
-_BACKTRACK_MAX_SESSIONS = 256
+_BACKTRACK_MAX_SESSIONS = int(os.environ.get("MAGMA_SESSION_HISTORY_MAX", "128"))
 
 
 def _check_backtrack(session_key: str, result_ids: List[str]) -> Optional[Dict[str, Any]]:
@@ -842,7 +842,7 @@ def _check_backtrack(session_key: str, result_ids: List[str]) -> Optional[Dict[s
 # --- Graph Walk Cache (module-level, 5-min TTL) ---
 _graph_walk_cache: Dict[str, Tuple[float, Dict[str, float]]] = {}
 _GRAPH_WALK_TTL = 300  # 5 minutes
-_GRAPH_WALK_MAX_CACHE = 512
+_GRAPH_WALK_MAX_CACHE = int(os.environ.get("MAGMA_GRAPH_WALK_CACHE_MAX", "256"))
 
 
 def _cache_key(node_ids: List[str], hops: int, intent: str = None) -> str:

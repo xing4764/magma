@@ -106,6 +106,7 @@ const OPS_ANCHOR_RULES = [
 ];
 
 let apiStarted = false;
+let magmaChildProcess = null;
 const pendingPrompts = new Map();
 const pendingRecalls = new Map();
 
@@ -187,6 +188,25 @@ async function isApiHealthy(cfg) {
   }
 }
 
+function killMagmaProcess(logger) {
+  if (magmaChildProcess) {
+    try {
+      logger?.info?.(`${TAG} killing MAGMA API process (pid=${magmaChildProcess.pid})`);
+      magmaChildProcess.kill();
+    } catch {
+      // Process may already be dead
+    }
+    magmaChildProcess = null;
+  }
+}
+
+function registerCleanupHandlers(cfg, logger) {
+  const cleanup = () => killMagmaProcess(logger);
+  process.on('exit', cleanup);
+  process.on('SIGINT', () => { cleanup(); process.exit(0); });
+  process.on('SIGTERM', () => { cleanup(); process.exit(0); });
+}
+
 async function ensureApiStarted(cfg, logger) {
   if (!cfg.autoStartApi || apiStarted) return;
   if (await isApiHealthy(cfg)) {
@@ -199,7 +219,7 @@ async function ensureApiStarted(cfg, logger) {
   }
   const child = spawn(cfg.python, ["-m", "magma.api.server"], {
     cwd: cfg.magmaCwd,
-    detached: true,
+    detached: false,
     stdio: "ignore",
     windowsHide: true,
     env: {
@@ -210,7 +230,8 @@ async function ensureApiStarted(cfg, logger) {
       ...(cfg.embeddingModel ? { MAGMA_EMBEDDING_MODEL: cfg.embeddingModel } : {}),
     },
   });
-  child.unref();
+  magmaChildProcess = child;
+  registerCleanupHandlers(cfg, logger);
   apiStarted = true;
   logger.info?.(`${TAG} started MAGMA API via ${cfg.python} -m magma.api.server`);
 }

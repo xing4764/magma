@@ -345,7 +345,7 @@ def create_app() -> FastAPI:
     @app.on_event("startup")
     async def startup():
         from magma.graph.sqlite_store import get_store
-        from magma.vector.encoder import Encoder
+        from magma.vector.encoder import get_encoder
         from magma.vector.faiss_index import get_faiss_index
 
         store = get_store()
@@ -354,7 +354,7 @@ def create_app() -> FastAPI:
         logger.info("Graph store initialized")
 
         try:
-            encoder = Encoder()
+            encoder = get_encoder()
             app.state.encoder = encoder
             dim = encoder.dimension
             logger.info(f"Encoder ready, dim={dim}, model={encoder.model_name}")
@@ -385,7 +385,7 @@ def create_app() -> FastAPI:
                 blob = node.get("embedding")
                 if blob:
                     vec = _np.frombuffer(blob, dtype=_np.float32)
-                    if vec.ndim == 1 and vec.shape[0] > 0:
+                    if vec.ndim == 1 and vec.shape[0] == getattr(encoder, 'dimension', 0):
                         entries.append((node["id"], vec))
             faiss_idx.build_from_embeddings(entries)
             logger.info(f"FAISS index built with {len(entries)} vectors, dim={faiss_idx.dimension}")
@@ -403,6 +403,11 @@ def create_app() -> FastAPI:
             app.state.backup_task = asyncio.create_task(_run_backup_loop(backup_interval))
             logger.info(f"Backup loop scheduled every {backup_interval}s")
 
+        encoder_check_interval = int(os.environ.get("MAGMA_ENCODER_CHECK_INTERVAL", "300"))
+        if encoder_check_interval > 0:
+            app.state.encoder_check_task = asyncio.create_task(_run_encoder_idle_check(encoder_check_interval))
+            logger.info(f"Encoder idle check scheduled every {encoder_check_interval}s")
+
     @app.on_event("shutdown")
     async def shutdown():
         task = getattr(app.state, "consolidation_task", None)
@@ -411,6 +416,9 @@ def create_app() -> FastAPI:
         backup_task = getattr(app.state, "backup_task", None)
         if backup_task:
             backup_task.cancel()
+        encoder_task = getattr(app.state, "encoder_check_task", None)
+        if encoder_task:
+            encoder_task.cancel()
 
     @app.get("/api/v1/health")
     async def health():
@@ -1362,6 +1370,19 @@ async def _run_backup_loop(interval: int):
         except Exception as e:
             logger.warning(f"Backup failed: {e}")
         await asyncio.sleep(interval)
+
+
+async def _run_encoder_idle_check(interval: int):
+    """Periodically check if encoder model should be unloaded due to idle timeout."""
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            encoder = getattr(app.state, "encoder", None)
+            if encoder and hasattr(encoder, "maybe_unload"):
+                if encoder.maybe_unload():
+                    logger.info("Encoder model unloaded due to idle timeout")
+        except Exception as e:
+            logger.warning(f"Encoder idle check failed: {e}")
 
 
 if __name__ == "__main__":
